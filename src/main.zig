@@ -9,6 +9,7 @@ const util = @import("util.zig");
 const socket = @import("socket.zig");
 const label = @import("label.zig");
 const agent = @import("agent.zig");
+const agent_claude = @import("agent_claude.zig");
 const lib_posix = @import("posix.zig");
 const signal = @import("signal.zig");
 const Cfg = @import("cfg.zig");
@@ -111,7 +112,7 @@ pub fn main(init: std.process.Init) !void {
         return labelClear(gpa, io, &cfg, sesh);
     } else if (std.mem.eql(u8, cmd, "agent")) {
         const sub = args.next() orelse {
-            return printError(io, "agent requires a subcommand (notify, ask, reply, status, events)", .{});
+            return printError(io, "agent requires a subcommand (notify, ask, reply, status, events, hook)", .{});
         };
         if (detectHelp(sub)) return help(io);
         if (std.mem.eql(u8, sub, "notify")) return agentNotify(gpa, io, &cfg, &args);
@@ -119,7 +120,8 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, sub, "ask")) return agentAsk(gpa, io, &cfg, &args);
         if (std.mem.eql(u8, sub, "reply")) return agentReply(gpa, io, &cfg, &args);
         if (std.mem.eql(u8, sub, "events")) return agentEvents(gpa, io, &cfg, &args);
-        return printError(io, "unknown agent subcommand \"{s}\" (notify, ask, reply, status, events)", .{sub});
+        if (std.mem.eql(u8, sub, "hook")) return agentHook(gpa, io, &cfg, &args);
+        return printError(io, "unknown agent subcommand \"{s}\" (notify, ask, reply, status, events, hook)", .{sub});
     } else if (std.mem.eql(u8, cmd, "completions") or std.mem.eql(u8, cmd, "c")) {
         const arg = args.next() orelse {
             return printError(io, "completions requires a shell argument (bash, zsh, fish, nu, yash)", .{});
@@ -473,6 +475,7 @@ fn help(io: std.Io) !void {
         \\  agent ask [--session s] --type t [--timeout secs]          Wait for a terminal's answer (JSON on stdin)
         \\  agent reply <rid> <nonce> --allow|--deny|--json d          Answer an ask from outside the terminal
         \\  agent events [--session s]                                 Stream agent events as JSON lines
+        \\  agent hook claude permission|question                      Claude Code hook: ask the terminal (hook JSON on stdin)
         \\  print-env [-s] <name> [key]                                Print tracked environment variables
         \\  [k]ill <name>... [--force]                                 Kill session and all attached clients
         \\  [hi]story <name> [--vt|--html] [--screen|--scrollback]     Output session scrollback
@@ -1040,16 +1043,35 @@ fn agentAsk(gpa: std.mem.Allocator, io: std.Io, cfg: *Cfg, args: anytype) !void 
     request.detail = content.value.detail;
     agent.validateAsk(request) catch |err| return agentWarn(io, "invalid ask: {s}", .{@errorName(err)});
 
-    const sesh = socket.resolveSessionOrEnv(gpa, io, session) catch return;
+    const decision = try requestDecision(gpa, io, cfg, session, request) orelse return;
+    defer gpa.free(decision);
+    var out_buf: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(io, &out_buf);
+    try stdout.interface.print("{s}\n", .{decision});
+    try stdout.interface.flush();
+}
+
+/// Sends an ask and waits for the answer. Returns the decision JSON (caller
+/// owns it) when answered; null on a timeout, a cancel, an older daemon, or
+/// outside a session.
+fn requestDecision(gpa: std.mem.Allocator, io: std.Io, cfg: *Cfg, session: ?[]const u8, ask: agent.AskRequest) !?[]u8 {
+    const sesh = socket.resolveSessionOrEnv(gpa, io, session) catch return null;
     defer gpa.free(sesh);
     const socket_path = try socket.getSocketPath(gpa, cfg.socket_dir, sesh);
     defer gpa.free(socket_path);
-    const payload = try std.json.Stringify.valueAlloc(gpa, request, .{ .emit_null_optional_fields = false });
+    var request = ask;
+    var payload = try std.json.Stringify.valueAlloc(gpa, request, .{ .emit_null_optional_fields = false });
     defer gpa.free(payload);
+    if (payload.len > agent.max_ask_payload and request.detail != null) {
+        // Too much to show anyway; ask without the detail rather than not at all.
+        request.detail = null;
+        gpa.free(payload);
+        payload = try std.json.Stringify.valueAlloc(gpa, request, .{ .emit_null_optional_fields = false });
+    }
 
-    const fd = ipc.connectSession(socket_path) catch return;
+    const fd = ipc.connectSession(socket_path) catch return null;
     defer lib_posix.close(fd);
-    ipc.send(fd, .AgentAsk, payload) catch return;
+    ipc.send(fd, .AgentAsk, payload) catch return null;
 
     // The daemon enforces the deadline; this is only a backstop.
     const give_up_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds() + @as(i64, @intCast(request.timeout_ms)) + 5_000;
@@ -1057,29 +1079,85 @@ fn agentAsk(gpa: std.mem.Allocator, io: std.Io, cfg: *Cfg, args: anytype) !void 
     defer sb.deinit();
     while (true) {
         const left = give_up_ms - std.Io.Timestamp.now(io, .awake).toMilliseconds();
-        if (left <= 0) return;
+        if (left <= 0) return null;
         var poll_fds = [_]lib_posix.pollfd{.{ .fd = fd, .events = lib_posix.POLL.IN, .revents = 0 }};
-        if ((lib_posix.poll(&poll_fds, @intCast(@min(left, std.math.maxInt(i32)))) catch return) == 0) return;
-        const n = sb.read(fd) catch return;
-        if (n == 0) return;
+        if ((lib_posix.poll(&poll_fds, @intCast(@min(left, std.math.maxInt(i32)))) catch return null) == 0) return null;
+        const n = sb.read(fd) catch return null;
+        if (n == 0) return null;
         while (sb.next()) |msg| switch (msg.header.tag) {
-            .Unsupported => return,
+            .Unsupported => return null,
             .AgentDecision => {
                 const Decision = struct { outcome: agent.Outcome, decision: ?std.json.Value = null };
-                const parsed = std.json.parseFromSlice(Decision, gpa, msg.payload, .{ .ignore_unknown_fields = true }) catch return;
+                const parsed = std.json.parseFromSlice(Decision, gpa, msg.payload, .{ .ignore_unknown_fields = true }) catch return null;
                 defer parsed.deinit();
-                if (parsed.value.outcome != .answered) return;
-                const decision = parsed.value.decision orelse return;
-                const out = try std.json.Stringify.valueAlloc(gpa, decision, .{});
-                defer gpa.free(out);
-                var out_buf: [4096]u8 = undefined;
-                var stdout = std.Io.File.stdout().writer(io, &out_buf);
-                try stdout.interface.print("{s}\n", .{out});
-                return stdout.interface.flush();
+                if (parsed.value.outcome != .answered) return null;
+                const decision = parsed.value.decision orelse return null;
+                return try std.json.Stringify.valueAlloc(gpa, decision, .{});
             },
             else => {},
         };
     }
+}
+
+/// `zmx agent hook claude <permission|question>`: a Claude Code hook. Reads
+/// the hook's JSON on stdin, asks the attached terminals, and prints the
+/// hook's JSON output when one answers. Prints nothing otherwise, so Claude
+/// asks in its own UI, and always exits 0.
+fn agentHook(gpa: std.mem.Allocator, io: std.Io, cfg: *Cfg, args: anytype) !void {
+    const agent_name = args.next() orelse return agentWarn(io, "agent hook requires an agent (claude)", .{});
+    if (detectHelp(agent_name)) return help(io);
+    if (!std.mem.eql(u8, agent_name, "claude")) return agentWarn(io, "agent hook supports only claude, got \"{s}\"", .{agent_name});
+    const hook_name = args.next() orelse return agentWarn(io, "agent hook claude requires permission or question", .{});
+    const hook = std.meta.stringToEnum(agent_claude.Hook, hook_name) orelse
+        return agentWarn(io, "unknown claude hook \"{s}\" (permission, question)", .{hook_name});
+    var session: ?[]const u8 = null;
+    var timeout_s: u64 = agent.default_ask_timeout_ms / 1000;
+    while (args.next()) |arg| {
+        const value = args.next() orelse return agentWarn(io, "{s} requires a value", .{arg});
+        if (std.mem.eql(u8, arg, "--session")) {
+            session = value;
+        } else if (std.mem.eql(u8, arg, "--timeout")) {
+            timeout_s = std.fmt.parseInt(u64, value, 10) catch
+                return agentWarn(io, "--timeout must be whole seconds, got \"{s}\"", .{value});
+        } else {
+            return agentWarn(io, "unknown agent hook option \"{s}\"", .{arg});
+        }
+    }
+
+    // Hook input can carry whole files (a Write's content); read it all, the
+    // detail is trimmed below.
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(gpa);
+    var buf: [16384]u8 = undefined;
+    while (input.items.len <= 16 * 1024 * 1024) {
+        const n = lib_posix.read(lib_posix.STDIN_FILENO, &buf) catch break;
+        if (n == 0) break;
+        try input.appendSlice(gpa, buf[0..n]);
+    }
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const hook_input = std.json.parseFromSliceLeaky(std.json.Value, arena, input.items, .{}) catch {
+        return agentWarn(io, "hook input on stdin must be JSON", .{});
+    };
+    const ask = try agent_claude.askFor(arena, hook, hook_input) orelse return;
+
+    const decision_json = try requestDecision(gpa, io, cfg, session, .{
+        .agent = "claude",
+        .type = ask.type,
+        .title = ask.title,
+        .summary = ask.summary,
+        .detail = ask.detail,
+        .timeout_ms = std.math.clamp(timeout_s *| 1000, agent.min_ask_timeout_ms, agent.max_ask_timeout_ms),
+    }) orelse return;
+    defer gpa.free(decision_json);
+    const decision = std.json.parseFromSliceLeaky(std.json.Value, arena, decision_json, .{}) catch return;
+    const out = try agent_claude.output(gpa, hook, hook_input, decision) orelse return;
+    defer gpa.free(out);
+    var out_buf: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(io, &out_buf);
+    try stdout.interface.print("{s}\n", .{out});
+    try stdout.interface.flush();
 }
 
 /// `zmx agent reply <rid> <nonce> --allow|--deny [--message m] | --json <decision>`:

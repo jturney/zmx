@@ -306,6 +306,9 @@ pub const Passthrough = struct {
     /// Whether the last byte held was ESC, which a `\\` at the start of the
     /// next read would turn into the terminator.
     tail_esc: bool = false,
+    /// Agents seen reporting `idle`, `error`, or `session_end` since the
+    /// caller last drained this: they have moved past anything they asked.
+    moved_on: std.ArrayList([]u8) = .empty,
 
     pub const Entry = struct {
         key: []u8,
@@ -322,6 +325,13 @@ pub const Passthrough = struct {
         }
         self.entries.deinit(gpa);
         self.partial.deinit(gpa);
+        self.clearMovedOn(gpa);
+        self.moved_on.deinit(gpa);
+    }
+
+    pub fn clearMovedOn(self: *Passthrough, gpa: std.mem.Allocator) void {
+        for (self.moved_on.items) |name| gpa.free(name);
+        self.moved_on.clearRetainingCapacity();
     }
 
     /// Scans one chunk of PTY output. Cheap when it holds no OSC 3008: one
@@ -440,7 +450,10 @@ pub const Passthrough = struct {
             }
             return; // notify and unknown kinds are one-off events
         }
-        if (field(metadata, "event") == null) return;
+        const event = field(metadata, "event") orelse return;
+        if (std.mem.eql(u8, event, "idle") or std.mem.eql(u8, event, "error") or std.mem.eql(u8, event, "session_end")) {
+            try self.moved_on.append(gpa, try gpa.dupe(u8, agent_name));
+        }
         const key = keyFor(&key_buf, "presence", agent_name, "") orelse return;
         return self.put(gpa, key, osc, null);
     }
@@ -815,4 +828,17 @@ test "passthrough drops an ask past its deadline at replay" {
     try std.testing.expect(try cache.appendReplay(alloc, &buf, 5000));
     try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
     try std.testing.expect(std.mem.indexOf(u8, buf.items, "kind=ask") == null);
+}
+
+test "passthrough notes agents that moved on" {
+    const alloc = std.testing.allocator;
+    var cache: Passthrough = .{};
+    defer cache.deinit(alloc);
+    try cache.scan(alloc, "\x1b]3008;start=claude;event=busy\x1b\\\x1b]3008;start=claude;event=idle;pid=9\x1b\\");
+    try cache.scan(alloc, "\x1b]3008;end=codex;event=session_end\x1b\\");
+    try std.testing.expectEqual(@as(usize, 2), cache.moved_on.items.len);
+    try std.testing.expectEqualStrings("claude", cache.moved_on.items[0]);
+    try std.testing.expectEqualStrings("codex", cache.moved_on.items[1]);
+    cache.clearMovedOn(alloc);
+    try std.testing.expectEqual(@as(usize, 0), cache.moved_on.items.len);
 }

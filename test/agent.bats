@@ -381,3 +381,72 @@ PY
   run attach_capture nest-e
   [[ "$output" != *"kind=ask"* ]]
 }
+
+# ============================================================================
+# Claude hook adapter
+# ============================================================================
+
+# start_hook <session> <hook> <json>: runs `zmx agent hook claude <hook>` in the
+# background with the hook input <json>; stdout in $BATS_TEST_TMPDIR/hook.out.
+start_hook() {
+  local session="$1" hook="$2" json="$3"
+  echo "$json" | "$ZMX" agent hook claude "$hook" --session "$session" > "$BATS_TEST_TMPDIR/hook.out" &
+  HOOK_PID=$!
+}
+
+@test "hook: a permission request answered allow" {
+  "$ZMX" run test-hook-perm -d sleep 30
+  wait_for_session test-hook-perm
+
+  start_hook test-hook-perm permission \
+    '{"hook_event_name":"PermissionRequest","tool_name":"Bash","tool_input":{"command":"make clean"},"permission_suggestions":[]}'
+  read -r rid nonce < <(wait_for_pending test-hook-perm)
+  run "$ZMX" agent status --session test-hook-perm --json
+  [[ "$output" == *'"title":"Bash","summary":"make clean"'* ]]
+
+  "$ZMX" agent reply --session test-hook-perm "$rid" "$nonce" --allow
+  wait "$HOOK_PID"
+  [ "$(cat "$BATS_TEST_TMPDIR/hook.out")" = \
+    '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}' ]
+}
+
+@test "hook: a question answered with its option" {
+  "$ZMX" run test-hook-q -d sleep 30
+  wait_for_session test-hook-q
+
+  start_hook test-hook-q question \
+    '{"hook_event_name":"PreToolUse","tool_name":"AskUserQuestion","tool_input":{"questions":[{"question":"Which color?","header":"Color","options":[{"label":"Red","description":""},{"label":"Blue","description":""}],"multiSelect":false}]}}'
+  read -r rid nonce < <(wait_for_pending test-hook-q)
+  "$ZMX" agent reply --session test-hook-q "$rid" "$nonce" --json '{"answers":{"Which color?":"Blue"}}'
+  wait "$HOOK_PID"
+  run cat "$BATS_TEST_TMPDIR/hook.out"
+  [[ "$output" == *'"hookEventName":"PreToolUse","permissionDecision":"allow"'* ]]
+  [[ "$output" == *'"answers":{"Which color?":"Blue"}'* ]]
+  [[ "$output" == *'"questions":[{"question":"Which color?"'* ]]
+}
+
+@test "hook: a question hook for another tool returns at once" {
+  "$ZMX" run test-hook-other -d sleep 30
+  wait_for_session test-hook-other
+  run bash -c 'echo "{\"tool_name\":\"Bash\",\"tool_input\":{}}" | timeout 3 "$0" agent hook claude question --session test-hook-other' "$ZMX"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "hook: the agent reporting idle on its own tty cancels the ask" {
+  "$ZMX" run test-hook-idle -d bash
+  wait_for_session test-hook-idle
+
+  start_hook test-hook-idle permission '{"tool_name":"Bash","tool_input":{"command":"ls"}}'
+  wait_for_pending test-hook-idle > /dev/null
+  # What Supacode's tty-writing hooks emit when the turn moves on.
+  "$ZMX" send test-hook-idle "printf '\\033]3008;start=claude;event=idle\\033\\\\'"$'\r'
+  wait "$HOOK_PID"
+  [ ! -s "$BATS_TEST_TMPDIR/hook.out" ]
+}
+
+@test "hook: outside a session it prints nothing" {
+  run bash -c 'echo "{\"tool_name\":\"Bash\",\"tool_input\":{}}" | env -u ZMX_SESSION "$0" agent hook claude permission' "$ZMX"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}

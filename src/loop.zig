@@ -468,6 +468,10 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                     daemon.passthrough.scan(gpa, buf[0..n]) catch |err| {
                         std.log.warn("agent passthrough scan failed: {s}", .{@errorName(err)});
                     };
+                    // An agent in this session that reports idle on its own
+                    // tty (not through `zmx agent notify`) has moved on too.
+                    for (daemon.passthrough.moved_on.items) |name| daemon.cancelAgentAsks(gpa, name);
+                    daemon.passthrough.clearMovedOn(gpa);
                     daemon.setPwd(&term);
                     daemon.has_pty_output = true;
 
