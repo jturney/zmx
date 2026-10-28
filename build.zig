@@ -20,6 +20,7 @@ pub fn build(b: *std.Build) void {
         @as([]const u8, build_zig_zon.version);
 
     const enable_daemon = b.option(bool, "daemon", "Include daemon support and Ghostty VT in zmx pkg") orelse true;
+    const strip = b.option(bool, "strip", "Strip debug info from the zmx binary");
 
     const options = b.addOptions();
     options.addOption([]const u8, "version", version);
@@ -38,6 +39,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = strip,
         .link_libc = true,
         .imports = &.{
             .{
