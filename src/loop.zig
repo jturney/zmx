@@ -993,16 +993,6 @@ pub const Daemon = struct {
         const is_leader = self.leader_client_fd == client.socket_fd;
         const resize = std.mem.bytesToValue(ipc.Resize, payload);
 
-        // Resize our terminal (not yet the PTY) to the leader's size before
-        // serializing, so the snapshot is laid out for the width the client
-        // will render it at instead of being wrapped a second time on arrival.
-        // Cursor position stays consistent because it is serialized from the
-        // same, already-resized terminal; the PTY is resized below, so the
-        // shell's own SIGWINCH redraw still arrives after the snapshot.
-        if (is_leader) {
-            try resizeTerm(gpa, term, resize.cols, resize.rows);
-        }
-
         if (self.has_pty_output) {
             const cursor = &term.screens.active.cursor;
             std.log.debug(
@@ -1028,6 +1018,10 @@ pub const Daemon = struct {
 
         // only resize if leader
         if (is_leader) {
+            // Supacode: snapshot before resizing. A surface can attach at a
+            // transient placeholder size, and a snapshot laid out for it would
+            // hard-wrap the restored scrollback at that width.
+            try resizeTerm(gpa, term, resize.cols, resize.rows);
             var ws = resize.winsize();
             _ = cross.ioctl(pty_fd, cross.TIOCSWINSZ, &ws);
 
@@ -1478,6 +1472,41 @@ test "hasTerminalClient follows attach, detach and detach-all" {
     daemon.handleDetachAll(alloc);
     try std.testing.expect(!daemon.hasTerminalClient());
     try std.testing.expectEqual(@as(?i32, null), daemon.leader_client_fd);
+}
+
+test "handleInit snapshots a re-attach before resizing the terminal" {
+    const alloc = std.testing.allocator;
+    const cfg = Cfg{ .socket_dir = "", .log_dir = "" };
+    var term = try initTerminal(alloc, std.testing.io, .{ .cols = 120, .rows = 10 }, &cfg);
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+    // A line longer than the placeholder width the client attaches at.
+    stream.nextSlice(&@as([100]u8, @splat('a')));
+    stream.nextSlice("\r\nprompt$ ");
+
+    const expected = util.serializeTerminalState(alloc, &term) orelse return error.TestUnexpectedNull;
+    defer alloc.free(expected);
+
+    var daemon = testDaemon();
+    defer daemon.clients.deinit(alloc);
+    defer daemon.pty_write_buf.deinit(alloc);
+    daemon.has_pty_output = true;
+
+    const fds = try lib_posix.pipe2(.{});
+    const client = try testClient(alloc, fds[0], false);
+    defer {
+        client.deinit(alloc);
+        alloc.destroy(client);
+    }
+    defer lib_posix.close(fds[1]);
+
+    // A placeholder-sized attach must not reflow the snapshot it receives.
+    const resize = ipc.Resize{ .rows = 10, .cols = 46 };
+    try daemon.handleInit(alloc, client, fds[1], &term, std.mem.asBytes(&resize));
+
+    try std.testing.expectEqual(@as(u16, 46), term.cols);
+    try std.testing.expect(std.mem.indexOf(u8, client.write_buf.items, expected) != null);
 }
 
 test "send queues PTY input without changing leader" {
