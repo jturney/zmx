@@ -209,6 +209,11 @@ for line in sys.stdin:
   start_ask test-ask-nonce
   read -r rid nonce < <(wait_for_pending test-ask-nonce)
 
+  # The plain listing shows it too, though no presence was ever reported.
+  run "$ZMX" agent status --session test-ask-nonce
+  [ "$status" -eq 0 ]
+  [ "$output" = "$(printf 'claude\task %s\tpermission\tBash\tmake clean' "$rid")" ]
+
   run "$ZMX" agent reply --session test-ask-nonce "$rid" 00000000000000000000000000000000 --allow
   [ "$status" -eq 2 ]
   [[ "$output" == *"unknown rid"* ]]

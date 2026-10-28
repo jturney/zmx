@@ -1307,16 +1307,22 @@ fn agentStatus(gpa: std.mem.Allocator, io: std.Io, cfg: *Cfg, args: anytype) !vo
     }
     const State = struct {
         agents: []const struct { agent: []const u8, event: agent.Event, pid: ?i32 = null, at: i64 },
+        pending: []const struct { rid: u32, agent: []const u8, type: agent.AskType, title: []const u8, summary: []const u8 } = &.{},
     };
     const parsed = try std.json.parseFromSlice(State, gpa, payload, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
-    if (parsed.value.agents.len == 0) {
+    if (parsed.value.agents.len == 0 and parsed.value.pending.len == 0) {
         try stdout.interface.print("no agent activity\n", .{});
     }
     for (parsed.value.agents) |a| {
         try stdout.interface.print("{s}\t{t}", .{ a.agent, a.event });
         if (a.pid) |pid| try stdout.interface.print("\tpid={d}", .{pid});
         try stdout.interface.print("\n", .{});
+    }
+    // An ask can be pending with no presence recorded here: an agent whose
+    // hooks report presence on its tty shows up only in PTY output.
+    for (parsed.value.pending) |a| {
+        try stdout.interface.print("{s}\task {d}\t{t}\t{s}\t{s}\n", .{ a.agent, a.rid, a.type, a.title, a.summary });
     }
     try stdout.interface.flush();
 }
