@@ -36,10 +36,24 @@ pub const Tag = enum(u8) {
     /// A process in the session reports agent activity; payload is JSON
     /// `agent.Notify`. Reply: `Ack`.
     AgentNotify = 128,
+    /// A process blocks on a decision; payload is JSON `agent.AskRequest`.
+    /// Reply (possibly much later): `AgentDecision`.
+    AgentAsk = 129,
+    /// Daemon to terminal clients: an ask is waiting, `{rid, nonce}`.
+    AgentPending = 130,
+    /// Daemon to terminal clients: an ask is gone, `{rid}`.
+    AgentResolved = 131,
+    /// An answer to an ask, `{rid, nonce, decision}`. Reply: `Ack` with
+    /// `{ok, error?}`.
+    AgentReply = 132,
+    /// Daemon to the asker: `{rid, outcome, decision?}`.
+    AgentDecision = 133,
     /// Request the session's agent state. Reply: `AgentStateData`.
     AgentStateGet = 134,
     /// JSON snapshot of the session's agent state.
     AgentStateData = 135,
+    /// Stream agent events (JSON per `AgentStateData` frame) until disconnect.
+    AgentSubscribe = 136,
     Unsupported = 255,
     // Non-exhaustive: this enum comes off the wire via bytesToValue and
     // @enumFromInt, so out-of-range values are representable
@@ -371,7 +385,9 @@ test "Tag wire values are frozen" {
 
 test "agent Tag wire values are frozen" {
     inline for (.{
-        .{ Tag.AgentNotify, 128 }, .{ Tag.AgentStateGet, 134 }, .{ Tag.AgentStateData, 135 },
+        .{ Tag.AgentNotify, 128 },   .{ Tag.AgentAsk, 129 },       .{ Tag.AgentPending, 130 },
+        .{ Tag.AgentResolved, 131 }, .{ Tag.AgentReply, 132 },     .{ Tag.AgentDecision, 133 },
+        .{ Tag.AgentStateGet, 134 }, .{ Tag.AgentStateData, 135 }, .{ Tag.AgentSubscribe, 136 },
     }) |p| try std.testing.expectEqual(@as(u8, p[1]), @backingInt(p[0]));
 }
 

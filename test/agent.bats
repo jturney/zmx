@@ -147,3 +147,156 @@ PY
   run "$ZMX" history test-agent-history --vt
   [[ "$output" != *"3008"* ]]
 }
+
+# ============================================================================
+# Asks
+# ============================================================================
+
+# start_ask <session> [extra args...]: runs `zmx agent ask` in the background
+# with a small permission request, its stdout in $BATS_TEST_TMPDIR/ask.out.
+start_ask() {
+  local session="$1"; shift
+  echo '{"title":"Bash","summary":"make clean","detail":{"command":"make clean"}}' |
+    "$ZMX" agent ask --session "$session" --type permission "$@" > "$BATS_TEST_TMPDIR/ask.out" &
+  ASK_PID=$!
+}
+
+# wait_for_pending <session>: waits until the session shows a pending ask and
+# prints its rid and nonce (from the event stream, which carries the nonce).
+wait_for_pending() {
+  local session="$1" i=0
+  while (( i < 50 )); do
+    if "$ZMX" agent status --session "$session" --json | grep -q '"pending":\[{'; then
+      timeout 1 "$ZMX" agent events --session "$session" 2>/dev/null |
+        python3 -c 'import json,sys
+for line in sys.stdin:
+    e = json.loads(line)
+    if e.get("type") == "ask":
+        print(e["rid"], e["nonce"]); break'
+      return 0
+    fi
+    sleep 0.1
+    (( i++ )) || true
+  done
+  echo "Timed out waiting for a pending ask in '$session'" >&2
+  return 1
+}
+
+@test "ask: an out-of-band reply answers it" {
+  "$ZMX" run test-ask -d sleep 30
+  wait_for_session test-ask
+
+  start_ask test-ask
+  read -r rid nonce < <(wait_for_pending test-ask)
+  [ -n "$nonce" ]
+
+  run "$ZMX" agent reply --session test-ask "$rid" "$nonce" --allow
+  [ "$status" -eq 0 ]
+  wait "$ASK_PID"
+  [ "$(cat "$BATS_TEST_TMPDIR/ask.out")" = '{"behavior":"allow"}' ]
+
+  # Gone once answered; a second answer is refused.
+  run "$ZMX" agent status --session test-ask --json
+  [[ "$output" == *'"pending":[]'* ]]
+  run "$ZMX" agent reply --session test-ask "$rid" "$nonce" --deny
+  [ "$status" -eq 2 ]
+}
+
+@test "ask: a wrong nonce is refused and leaves it pending" {
+  "$ZMX" run test-ask-nonce -d sleep 30
+  wait_for_session test-ask-nonce
+
+  start_ask test-ask-nonce
+  read -r rid nonce < <(wait_for_pending test-ask-nonce)
+
+  run "$ZMX" agent reply --session test-ask-nonce "$rid" 00000000000000000000000000000000 --allow
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"unknown rid"* ]]
+  run "$ZMX" agent status --session test-ask-nonce --json
+  [[ "$output" == *'"pending":[{"rid":'"$rid"* ]]
+
+  "$ZMX" agent reply --session test-ask-nonce "$rid" "$nonce" --json '{"behavior":"deny","message":"no"}'
+  wait "$ASK_PID"
+  [ "$(cat "$BATS_TEST_TMPDIR/ask.out")" = '{"behavior":"deny","message":"no"}' ]
+}
+
+@test "ask: a timeout prints nothing" {
+  "$ZMX" run test-ask-timeout -d sleep 30
+  wait_for_session test-ask-timeout
+
+  start_ask test-ask-timeout --timeout 1
+  wait "$ASK_PID"
+  [ ! -s "$BATS_TEST_TMPDIR/ask.out" ]
+  run "$ZMX" agent status --session test-ask-timeout --json
+  [[ "$output" == *'"pending":[]'* ]]
+}
+
+@test "ask: the agent going idle cancels it" {
+  "$ZMX" run test-ask-idle -d sleep 30
+  wait_for_session test-ask-idle
+
+  start_ask test-ask-idle
+  wait_for_pending test-ask-idle > /dev/null
+  "$ZMX" agent notify --session test-ask-idle --event idle
+  wait "$ASK_PID"
+  [ ! -s "$BATS_TEST_TMPDIR/ask.out" ]
+}
+
+@test "ask: killing the asker withdraws it" {
+  "$ZMX" run test-ask-kill -d sleep 30
+  wait_for_session test-ask-kill
+
+  start_ask test-ask-kill
+  wait_for_pending test-ask-kill > /dev/null
+  timeout 3 "$ZMX" agent events --session test-ask-kill > "$BATS_TEST_TMPDIR/events.out" &
+  sleep 0.3
+  kill "$ASK_PID"
+  wait "$ASK_PID" 2>/dev/null || true
+  for _ in $(seq 30); do grep -q '"why":"cancelled"' "$BATS_TEST_TMPDIR/events.out" && break; sleep 0.1; done
+  grep -q '"type":"resolved","rid":1,"why":"cancelled"' "$BATS_TEST_TMPDIR/events.out"
+}
+
+@test "ask: outside a session it returns at once with nothing" {
+  run bash -c 'echo "{}" | env -u ZMX_SESSION "$0" agent ask --type permission' "$ZMX"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "ask: a terminal answers it in-band, and the reply never reaches the PTY" {
+  # `cat` echoes whatever reaches the PTY, so a leaked reply would show up in
+  # the session's history.
+  "$ZMX" run test-ask-tty -d bash -c 'echo READY; exec cat'
+  wait_for_output test-ask-tty "READY"
+
+  # Ask before the terminal attaches, so it learns of the ask from the replay.
+  start_ask test-ask-tty
+  wait_for_pending test-ask-tty > /dev/null
+
+  python3 - "$ZMX" test-ask-tty 3>&- <<'PY'
+import base64, json, os, pty, re, select, sys, time
+zmx, session = sys.argv[1], sys.argv[2]
+pid, fd = pty.fork()
+if pid == 0:
+    os.execv(zmx, [zmx, "attach", session])
+out, deadline, m = b"", time.time() + 10, None
+while time.time() < deadline and not m:
+    if select.select([fd], [], [], 0.1)[0]:
+        out += os.read(fd, 65536)
+    m = re.search(rb"kind=ask;rid=(\d+);nonce=([0-9a-f]{32});sess=([A-Za-z0-9+/=]+);", out)
+if not m:
+    sys.exit("the attached terminal never saw the ask")
+decision = base64.b64encode(json.dumps({"behavior": "allow"}).encode()).decode()
+reply = "\x1b_zmx-reply;sess=%s;rid=%s;nonce=%s;d=%s\x1b\\" % (m[3].decode(), m[1].decode(), m[2].decode(), decision)
+# Split across two writes, as a terminal's paste can be.
+os.write(fd, reply[:9].encode()); time.sleep(0.05); os.write(fd, reply[9:].encode())
+time.sleep(1)
+os.write(fd, b"\x1c")  # ctrl+\ detaches
+time.sleep(0.3)
+os.kill(pid, 9)
+PY
+
+  wait "$ASK_PID"
+  [ "$(cat "$BATS_TEST_TMPDIR/ask.out")" = '{"behavior":"allow"}' ]
+  run "$ZMX" history test-ask-tty
+  [[ "$output" != *"zmx-reply"* ]]
+}

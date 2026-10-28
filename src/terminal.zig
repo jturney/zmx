@@ -1,4 +1,5 @@
 const std = @import("std");
+const agent_reply = @import("agent_reply.zig");
 const build_options = @import("build_options");
 const util = @import("util.zig");
 const testing = std.testing;
@@ -31,6 +32,9 @@ fn hasPrivateMarker(csi: ghostty_vt.Parser.Action.CSI) bool {
 /// answers the queries the app broadcasts, so a reply from a passive viewer
 /// would otherwise make it leader and resize the session to its window.
 pub fn isUserInput(payload: []const u8) bool {
+    // An agent reply forwarded from a session upstream (a nested zmx over
+    // ssh) is a deliberate answer the user clicked, so it must get through.
+    if (agent_reply.containsReply(payload)) return true;
     var parser = ghostty_vt.Parser.init();
     var i: usize = 0;
     while (i < payload.len) {
@@ -826,6 +830,11 @@ test "serializeTerminalState scrollback + size mismatch nested roundtrip" {
 
     try expectScreensMatch(alloc, &inner, &client);
     try expectCursorAt(&client, inner_cursor_y, inner_cursor_x);
+}
+
+test "isUserInput: a complete agent reply counts, a partial one doesn't" {
+    try testing.expect(isUserInput("\x1b_zmx-reply;sess=ZGV2;rid=1;nonce=00;d=e30=\x1b\\"));
+    try testing.expect(!isUserInput("\x1b_zmx-reply;sess=ZGV2;rid=1"));
 }
 
 test "isUserInput: printable characters" {

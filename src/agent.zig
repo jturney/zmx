@@ -147,6 +147,130 @@ pub fn encodeNotifyText(gpa: std.mem.Allocator, text: []const u8, budget: usize)
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// Asks: a blocking request (a permission prompt, a question) that waits in
+// the daemon until a terminal replies, it times out, or its asker goes away.
+
+pub const AskType = enum { permission, question };
+
+pub const default_ask_timeout_ms: u64 = 300_000;
+pub const min_ask_timeout_ms: u64 = 1_000;
+pub const max_ask_timeout_ms: u64 = 30 * 60_000;
+/// Asks pending per session; more are refused with `busy`.
+pub const max_pending_asks = 16;
+/// Largest `AgentAsk` payload accepted (the IPC frame limit is far higher,
+/// but the OSC that carries an ask is small).
+pub const max_ask_payload = 64 * 1024;
+/// Metadata budget for an ask's OSC, under the 2047 bytes the OSC 3008 patch
+/// keeps. The detail is shed first, then the summary is shortened.
+pub const ask_metadata_budget = 1900;
+
+/// `AgentAsk` payload.
+pub const AskRequest = struct {
+    v: u32 = wire_version,
+    agent: []const u8 = "claude",
+    type: AskType,
+    title: []const u8 = "",
+    summary: []const u8 = "",
+    /// Shown in the UI as is: the trimmed tool input or the questions.
+    detail: ?std.json.Value = null,
+    timeout_ms: u64 = default_ask_timeout_ms,
+};
+
+pub fn validateAsk(a: AskRequest) ValidationError!void {
+    if (a.v != wire_version) return error.UnsupportedVersion;
+    if (!isValidAgentName(a.agent)) return error.InvalidAgentName;
+    if (!std.unicode.utf8ValidateSlice(a.title) or !std.unicode.utf8ValidateSlice(a.summary)) {
+        return error.InvalidUtf8;
+    }
+}
+
+/// How an ask ended, as its asker hears it (`AgentDecision.outcome`).
+pub const Outcome = enum { answered, timeout, cancelled, busy, invalid };
+
+/// Why an ask left the screen (`kind=resolved;why=`).
+pub const ResolveReason = enum { answered, timeout, cancelled };
+
+/// An ask waiting for a reply.
+pub const PendingAsk = struct {
+    rid: u32,
+    nonce: [16]u8,
+    /// The connection blocked in `zmx agent ask`; the decision goes there.
+    asker_fd: i32,
+    agent: []u8,
+    type: AskType,
+    title: []u8,
+    summary: []u8,
+    created_ms: i64,
+    deadline_ms: i64,
+    /// The rendered `kind=ask` OSC, replayed verbatim on attach.
+    osc: []u8,
+
+    pub fn deinit(self: PendingAsk, gpa: std.mem.Allocator) void {
+        gpa.free(self.agent);
+        gpa.free(self.title);
+        gpa.free(self.summary);
+        gpa.free(self.osc);
+    }
+
+    pub fn nonceHex(self: *const PendingAsk) [32]u8 {
+        return std.fmt.bytesToHex(self.nonce, .lower);
+    }
+
+    /// Whether `hex` is this ask's nonce, compared in constant time.
+    pub fn nonceMatches(self: *const PendingAsk, hex: []const u8) bool {
+        if (hex.len != 32) return false;
+        var given: [16]u8 = undefined;
+        _ = std.fmt.hexToBytes(&given, hex) catch return false;
+        return std.crypto.timing_safe.eql([16]u8, given, self.nonce);
+    }
+};
+
+pub fn renderAsk(
+    gpa: std.mem.Allocator,
+    agent: []const u8,
+    rid: u32,
+    nonce_hex: []const u8,
+    session: []const u8,
+    ask_type: AskType,
+    title: []const u8,
+    summary: []const u8,
+    detail_json: []const u8,
+) ![]u8 {
+    const encoder = std.base64.standard.Encoder;
+    const sess = try gpa.alloc(u8, encoder.calcSize(session.len));
+    defer gpa.free(sess);
+    _ = encoder.encode(sess, session);
+    const encoded_title = try encodeNotifyText(gpa, title, notify_title_budget);
+    defer gpa.free(encoded_title);
+    const head = try std.fmt.allocPrint(
+        gpa,
+        "kind=ask;rid={d};nonce={s};sess={s};type={t};title={s}",
+        .{ rid, nonce_hex, sess, ask_type, encoded_title },
+    );
+    defer gpa.free(head);
+
+    const det = try gpa.alloc(u8, encoder.calcSize(detail_json.len));
+    defer gpa.free(det);
+    _ = encoder.encode(det, detail_json);
+    const sum_full = try encodeNotifyText(gpa, summary, notify_body_budget);
+    defer gpa.free(sum_full);
+
+    // Everything fits: send it all.
+    if (head.len + ";sum=".len + sum_full.len + ";det=".len + det.len <= ask_metadata_budget) {
+        return std.fmt.allocPrint(gpa, "\x1b]3008;start={s};{s};sum={s};det={s}\x1b\\", .{ agent, head, sum_full, det });
+    }
+    // Shed the detail, then shorten the summary to what's left.
+    const room = ask_metadata_budget -| (head.len + ";sum=".len);
+    const sum = try encodeNotifyText(gpa, summary, @min(notify_body_budget, room / 4 * 3));
+    defer gpa.free(sum);
+    return std.fmt.allocPrint(gpa, "\x1b]3008;start={s};{s};sum={s}\x1b\\", .{ agent, head, sum });
+}
+
+pub fn renderResolved(gpa: std.mem.Allocator, agent: []const u8, rid: u32, why: ResolveReason) ![]u8 {
+    return std.fmt.allocPrint(gpa, "\x1b]3008;start={s};kind=resolved;rid={d};why={t}\x1b\\", .{ agent, rid, why });
+}
+
 /// The latest presence per agent, oldest first, for replay and `zmx agent status`.
 pub const Store = struct {
     entries: std.ArrayList(Entry) = .empty,
@@ -199,15 +323,42 @@ pub const Store = struct {
         return self.entries.items.len > 0;
     }
 
-    /// `AgentStateData` payload.
-    pub fn stateJson(self: *const Store, gpa: std.mem.Allocator, session: []const u8) ![]u8 {
+    /// `AgentStateData` payload. Nonces are left out: anything that can ask
+    /// for state could otherwise answer the asks.
+    pub fn stateJson(self: *const Store, gpa: std.mem.Allocator, session: []const u8, asks: []const PendingAsk) ![]u8 {
         const AgentState = struct { agent: []const u8, event: Event, pid: ?i32, at: i64 };
         const agents = try gpa.alloc(AgentState, self.entries.items.len);
         defer gpa.free(agents);
         for (self.entries.items, agents) |entry, *out| {
             out.* = .{ .agent = entry.agent, .event = entry.event, .pid = entry.pid, .at = entry.at };
         }
-        return std.json.Stringify.valueAlloc(gpa, .{ .v = wire_version, .session = session, .agents = agents }, .{});
+        const AskState = struct {
+            rid: u32,
+            agent: []const u8,
+            type: AskType,
+            title: []const u8,
+            summary: []const u8,
+            created_ms: i64,
+            deadline_ms: i64,
+        };
+        const pending = try gpa.alloc(AskState, asks.len);
+        defer gpa.free(pending);
+        for (asks, pending) |ask, *out| {
+            out.* = .{
+                .rid = ask.rid,
+                .agent = ask.agent,
+                .type = ask.type,
+                .title = ask.title,
+                .summary = ask.summary,
+                .created_ms = ask.created_ms,
+                .deadline_ms = ask.deadline_ms,
+            };
+        }
+        return std.json.Stringify.valueAlloc(
+            gpa,
+            .{ .v = wire_version, .session = session, .agents = agents, .pending = pending },
+            .{},
+        );
     }
 };
 
@@ -297,11 +448,11 @@ test "store keeps the latest presence per agent, most recent last" {
         store.entries.items[1].osc,
     );
 
-    const json = try store.stateJson(alloc, "dev");
+    const json = try store.stateJson(alloc, "dev", &.{});
     defer alloc.free(json);
     try std.testing.expectEqualStrings(
         "{\"v\":1,\"session\":\"dev\",\"agents\":[{\"agent\":\"codex\",\"event\":\"idle\",\"pid\":null,\"at\":2}," ++
-            "{\"agent\":\"claude\",\"event\":\"awaiting_input\",\"pid\":99,\"at\":3}]}",
+            "{\"agent\":\"claude\",\"event\":\"awaiting_input\",\"pid\":99,\"at\":3}],\"pending\":[]}",
         json,
     );
 }
@@ -317,4 +468,42 @@ test "store drops the least recently updated agent past its cap" {
     }
     try std.testing.expectEqual(@as(usize, max_agents), store.entries.items.len);
     try std.testing.expectEqualStrings("a1", store.entries.items[0].agent);
+}
+
+test "ask renders its fields, shedding the detail first when too long" {
+    const alloc = std.testing.allocator;
+    const nonce = "0123456789abcdef0123456789abcdef";
+    const small = try renderAsk(alloc, "claude", 7, nonce, "dev", .permission, "Bash", "rm -rf build", "{\"command\":\"rm -rf build\"}");
+    defer alloc.free(small);
+    try std.testing.expectEqualStrings(
+        "\x1b]3008;start=claude;kind=ask;rid=7;nonce=" ++ nonce ++ ";sess=ZGV2;type=permission;title=QmFzaA==;" ++
+            "sum=cm0gLXJmIGJ1aWxk;det=eyJjb21tYW5kIjoicm0gLXJmIGJ1aWxkIn0=\x1b\\",
+        small,
+    );
+
+    const long_summary: [900]u8 = @splat('x');
+    var long_detail: [2002]u8 = @splat('y');
+    long_detail[0] = '"';
+    long_detail[long_detail.len - 1] = '"';
+    const big = try renderAsk(alloc, "claude", 8, nonce, "dev", .question, "Pick", &long_summary, &long_detail);
+    defer alloc.free(big);
+    try std.testing.expect(std.mem.indexOf(u8, big, ";det=") == null);
+    const metadata_len = big.len - "\x1b]3008;start=claude;".len - "\x1b\\".len;
+    try std.testing.expect(metadata_len <= ask_metadata_budget);
+}
+
+test "resolved names the ask and why it ended" {
+    const alloc = std.testing.allocator;
+    const osc = try renderResolved(alloc, "claude", 7, .timeout);
+    defer alloc.free(osc);
+    try std.testing.expectEqualStrings("\x1b]3008;start=claude;kind=resolved;rid=7;why=timeout\x1b\\", osc);
+}
+
+test "nonce comparison" {
+    var ask: PendingAsk = undefined;
+    ask.nonce = .{ 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef };
+    try std.testing.expect(ask.nonceMatches("0123456789abcdef0123456789abcdef"));
+    try std.testing.expect(!ask.nonceMatches("0123456789abcdef0123456789abcdee"));
+    try std.testing.expect(!ask.nonceMatches("short"));
+    try std.testing.expect(!ask.nonceMatches("zz23456789abcdef0123456789abcdef"));
 }

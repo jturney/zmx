@@ -5,6 +5,7 @@ comptime {
     _ = @import("ipc.zig");
     _ = @import("label.zig");
     _ = @import("agent.zig");
+    _ = @import("agent_reply.zig");
     _ = @import("signal.zig");
     _ = @import("loop.zig");
     _ = @import("terminal.zig");

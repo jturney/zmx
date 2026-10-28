@@ -111,12 +111,15 @@ pub fn main(init: std.process.Init) !void {
         return labelClear(gpa, io, &cfg, sesh);
     } else if (std.mem.eql(u8, cmd, "agent")) {
         const sub = args.next() orelse {
-            return printError(io, "agent requires a subcommand (notify, status)", .{});
+            return printError(io, "agent requires a subcommand (notify, ask, reply, status, events)", .{});
         };
         if (detectHelp(sub)) return help(io);
         if (std.mem.eql(u8, sub, "notify")) return agentNotify(gpa, io, &cfg, &args);
         if (std.mem.eql(u8, sub, "status")) return agentStatus(gpa, io, &cfg, &args);
-        return printError(io, "unknown agent subcommand \"{s}\" (notify, status)", .{sub});
+        if (std.mem.eql(u8, sub, "ask")) return agentAsk(gpa, io, &cfg, &args);
+        if (std.mem.eql(u8, sub, "reply")) return agentReply(gpa, io, &cfg, &args);
+        if (std.mem.eql(u8, sub, "events")) return agentEvents(gpa, io, &cfg, &args);
+        return printError(io, "unknown agent subcommand \"{s}\" (notify, ask, reply, status, events)", .{sub});
     } else if (std.mem.eql(u8, cmd, "completions") or std.mem.eql(u8, cmd, "c")) {
         const arg = args.next() orelse {
             return printError(io, "completions requires a shell argument (bash, zsh, fish, nu, yash)", .{});
@@ -467,6 +470,9 @@ fn help(io: std.Io) !void {
         \\  agent notify [--session s] --event e [--agent a] [--pid n] Report agent presence (for agent hooks)
         \\  agent notify [--session s] --title t [--body b]            Report an agent notification
         \\  agent status [--session s] [--json]                        Show the session's agent presence
+        \\  agent ask [--session s] --type t [--timeout secs]          Wait for a terminal's answer (JSON on stdin)
+        \\  agent reply <rid> <nonce> --allow|--deny|--json d          Answer an ask from outside the terminal
+        \\  agent events [--session s]                                 Stream agent events as JSON lines
         \\  print-env [-s] <name> [key]                                Print tracked environment variables
         \\  [k]ill <name>... [--force]                                 Kill session and all attached clients
         \\  [hi]story <name> [--vt|--html] [--screen|--scrollback]     Output session scrollback
@@ -595,10 +601,15 @@ fn help(io: std.Io) !void {
         \\  Outside a session, or on an older daemon, `agent notify` does nothing
         \\  and still exits 0, so hooks can call it unconditionally.
         \\
+        \\  `agent ask` blocks until an attached terminal answers (or the ask times
+        \\  out, or the agent moves on) and prints the decision JSON; it prints
+        \\  nothing when no answer comes, so the agent asks in the terminal instead.
+        \\
         \\  Examples:
         \\    zmx agent notify --event busy --agent claude
         \\    zmx agent notify --title "Done" --body "Tests pass"
         \\    zmx agent status --session dev --json
+        \\    echo '{{"title":"Bash","summary":"make clean"}}' | zmx agent ask --type permission
         \\
         \\Print-env:
         \\  Print tracked environment variables for the leader client of a session.
@@ -980,6 +991,208 @@ fn agentNotify(gpa: std.mem.Allocator, io: std.Io, cfg: *Cfg, args: anytype) !vo
         return;
     };
     gpa.free(reply);
+}
+
+/// `zmx agent ask`: blocks until a terminal answers, then prints the decision
+/// JSON. Reads `{title, summary, detail}` JSON on stdin. Always exits 0, and
+/// prints nothing on a timeout, a cancel, an older daemon, or outside a
+/// session, so the agent falls back to asking in the terminal.
+fn agentAsk(gpa: std.mem.Allocator, io: std.Io, cfg: *Cfg, args: anytype) !void {
+    var session: ?[]const u8 = null;
+    var request: agent.AskRequest = .{ .type = .permission };
+    var timeout_s: u64 = agent.default_ask_timeout_ms / 1000;
+    while (args.next()) |arg| {
+        if (detectHelp(arg)) return help(io);
+        const value = args.next() orelse return agentWarn(io, "{s} requires a value", .{arg});
+        if (std.mem.eql(u8, arg, "--session")) {
+            session = value;
+        } else if (std.mem.eql(u8, arg, "--agent")) {
+            request.agent = value;
+        } else if (std.mem.eql(u8, arg, "--type")) {
+            request.type = std.meta.stringToEnum(agent.AskType, value) orelse
+                return agentWarn(io, "unknown --type \"{s}\" (permission, question)", .{value});
+        } else if (std.mem.eql(u8, arg, "--timeout")) {
+            timeout_s = std.fmt.parseInt(u64, value, 10) catch
+                return agentWarn(io, "--timeout must be whole seconds, got \"{s}\"", .{value});
+        } else {
+            return agentWarn(io, "unknown agent ask option \"{s}\"", .{arg});
+        }
+    }
+    request.timeout_ms = std.math.clamp(timeout_s *| 1000, agent.min_ask_timeout_ms, agent.max_ask_timeout_ms);
+
+    // The ask's content arrives on stdin, so a hook can pipe it straight in.
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(gpa);
+    var buf: [4096]u8 = undefined;
+    while (input.items.len <= agent.max_ask_payload) {
+        const n = lib_posix.read(lib_posix.STDIN_FILENO, &buf) catch break;
+        if (n == 0) break;
+        try input.appendSlice(gpa, buf[0..n]);
+    }
+    if (input.items.len > agent.max_ask_payload) return agentWarn(io, "ask content is over {d} bytes", .{agent.max_ask_payload});
+    const Content = struct { title: []const u8 = "", summary: []const u8 = "", detail: ?std.json.Value = null };
+    const content = std.json.parseFromSlice(Content, gpa, if (input.items.len == 0) "{}" else input.items, .{
+        .ignore_unknown_fields = true,
+    }) catch return agentWarn(io, "ask content on stdin must be a JSON object", .{});
+    defer content.deinit();
+    request.title = content.value.title;
+    request.summary = content.value.summary;
+    request.detail = content.value.detail;
+    agent.validateAsk(request) catch |err| return agentWarn(io, "invalid ask: {s}", .{@errorName(err)});
+
+    const sesh = socket.resolveSessionOrEnv(gpa, io, session) catch return;
+    defer gpa.free(sesh);
+    const socket_path = try socket.getSocketPath(gpa, cfg.socket_dir, sesh);
+    defer gpa.free(socket_path);
+    const payload = try std.json.Stringify.valueAlloc(gpa, request, .{ .emit_null_optional_fields = false });
+    defer gpa.free(payload);
+
+    const fd = ipc.connectSession(socket_path) catch return;
+    defer lib_posix.close(fd);
+    ipc.send(fd, .AgentAsk, payload) catch return;
+
+    // The daemon enforces the deadline; this is only a backstop.
+    const give_up_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds() + @as(i64, @intCast(request.timeout_ms)) + 5_000;
+    var sb = try ipc.SocketBuffer.init(gpa);
+    defer sb.deinit();
+    while (true) {
+        const left = give_up_ms - std.Io.Timestamp.now(io, .awake).toMilliseconds();
+        if (left <= 0) return;
+        var poll_fds = [_]lib_posix.pollfd{.{ .fd = fd, .events = lib_posix.POLL.IN, .revents = 0 }};
+        if ((lib_posix.poll(&poll_fds, @intCast(@min(left, std.math.maxInt(i32)))) catch return) == 0) return;
+        const n = sb.read(fd) catch return;
+        if (n == 0) return;
+        while (sb.next()) |msg| switch (msg.header.tag) {
+            .Unsupported => return,
+            .AgentDecision => {
+                const Decision = struct { outcome: agent.Outcome, decision: ?std.json.Value = null };
+                const parsed = std.json.parseFromSlice(Decision, gpa, msg.payload, .{ .ignore_unknown_fields = true }) catch return;
+                defer parsed.deinit();
+                if (parsed.value.outcome != .answered) return;
+                const decision = parsed.value.decision orelse return;
+                const out = try std.json.Stringify.valueAlloc(gpa, decision, .{});
+                defer gpa.free(out);
+                var out_buf: [4096]u8 = undefined;
+                var stdout = std.Io.File.stdout().writer(io, &out_buf);
+                try stdout.interface.print("{s}\n", .{out});
+                return stdout.interface.flush();
+            },
+            else => {},
+        };
+    }
+}
+
+/// `zmx agent reply <rid> <nonce> --allow|--deny [--message m] | --json <decision>`:
+/// answers an ask from outside the terminal. Exits 2 when the daemon
+/// rejects it (unknown rid, wrong nonce, already answered).
+fn agentReply(gpa: std.mem.Allocator, io: std.Io, cfg: *Cfg, args: anytype) !void {
+    var session: ?[]const u8 = null;
+    var positional: [2][]const u8 = undefined;
+    var positional_len: usize = 0;
+    var behavior: ?[]const u8 = null;
+    var message: ?[]const u8 = null;
+    var json: ?[]const u8 = null;
+    while (args.next()) |arg| {
+        if (detectHelp(arg)) return help(io);
+        if (std.mem.eql(u8, arg, "--allow")) {
+            behavior = "allow";
+        } else if (std.mem.eql(u8, arg, "--deny")) {
+            behavior = "deny";
+        } else if (std.mem.eql(u8, arg, "--message")) {
+            message = args.next() orelse return printError(io, "--message requires a value", .{});
+        } else if (std.mem.eql(u8, arg, "--json")) {
+            json = args.next() orelse return printError(io, "--json requires a value", .{});
+        } else if (std.mem.eql(u8, arg, "--session")) {
+            session = args.next() orelse return printError(io, "--session requires a value", .{});
+        } else if (positional_len < positional.len) {
+            positional[positional_len] = arg;
+            positional_len += 1;
+        } else {
+            return printError(io, "unexpected argument \"{s}\"", .{arg});
+        }
+    }
+    if (positional_len != 2) return printError(io, "agent reply needs <rid> <nonce>", .{});
+    const rid = std.fmt.parseInt(u32, positional[0], 10) catch return printError(io, "rid must be a number", .{});
+    const nonce = positional[1];
+
+    const decision = if (json) |j| blk: {
+        if (!(std.json.validate(gpa, j) catch false)) return printError(io, "--json must be valid JSON", .{});
+        break :blk try gpa.dupe(u8, j);
+    } else if (behavior) |b|
+        try std.json.Stringify.valueAlloc(gpa, .{ .behavior = b, .message = message }, .{ .emit_null_optional_fields = false })
+    else
+        return printError(io, "agent reply needs --allow, --deny, or --json", .{});
+    defer gpa.free(decision);
+
+    const sesh = socket.resolveSessionOrEnv(gpa, io, session) catch {
+        return printError(io, "session name required (--session <name>, or run inside a zmx session)", .{});
+    };
+    defer gpa.free(sesh);
+    const socket_path = try socket.getSocketPath(gpa, cfg.socket_dir, sesh);
+    defer gpa.free(socket_path);
+    const payload = try std.fmt.allocPrint(gpa, "{{\"rid\":{d},\"nonce\":", .{rid});
+    defer gpa.free(payload);
+    const nonce_json = try std.json.Stringify.valueAlloc(gpa, nonce, .{});
+    defer gpa.free(nonce_json);
+    const full = try std.mem.concat(gpa, u8, &.{ payload, nonce_json, ",\"decision\":", decision, "}" });
+    defer gpa.free(full);
+
+    const ack = ipc.roundTripForTag(gpa, socket_path, .AgentReply, full, .Ack) catch |err| switch (err) {
+        error.Unsupported => return printError(io, "session \"{s}\" does not support agent events (daemon too old?)", .{sesh}),
+        else => printLabelError(io, sesh, err),
+    };
+    defer gpa.free(ack);
+    const Ack = struct { ok: bool, @"error": ?[]const u8 = null };
+    const result = std.json.parseFromSlice(Ack, gpa, ack, .{ .ignore_unknown_fields = true }) catch {
+        return printError(io, "unexpected reply from session \"{s}\"", .{sesh});
+    };
+    defer result.deinit();
+    if (result.value.ok) return;
+    var err_buf: [1024]u8 = undefined;
+    var w = std.Io.File.stderr().writer(io, &err_buf);
+    w.interface.print("error: reply rejected: {s}\n", .{result.value.@"error" orelse "unknown"}) catch {};
+    w.interface.flush() catch {};
+    std.process.exit(2);
+}
+
+/// `zmx agent events`: prints agent events as JSON lines until the session
+/// ends or this is interrupted. Pending asks include their nonce.
+fn agentEvents(gpa: std.mem.Allocator, io: std.Io, cfg: *Cfg, args: anytype) !void {
+    var session: ?[]const u8 = null;
+    while (args.next()) |arg| {
+        if (detectHelp(arg)) return help(io);
+        if (std.mem.eql(u8, arg, "--session")) {
+            session = args.next() orelse return printError(io, "--session requires a value", .{});
+        } else {
+            return printError(io, "unknown agent events option \"{s}\"", .{arg});
+        }
+    }
+    const sesh = socket.resolveSessionOrEnv(gpa, io, session) catch {
+        return printError(io, "session name required (--session <name>, or run inside a zmx session)", .{});
+    };
+    defer gpa.free(sesh);
+    const socket_path = try socket.getSocketPath(gpa, cfg.socket_dir, sesh);
+    defer gpa.free(socket_path);
+    const fd = ipc.connectSession(socket_path) catch |err| printLabelError(io, sesh, err);
+    defer lib_posix.close(fd);
+    ipc.send(fd, .AgentSubscribe, "") catch |err| printLabelError(io, sesh, err);
+
+    var out_buf: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(io, &out_buf);
+    var sb = try ipc.SocketBuffer.init(gpa);
+    defer sb.deinit();
+    while (true) {
+        const n = sb.read(fd) catch return;
+        if (n == 0) return;
+        while (sb.next()) |msg| switch (msg.header.tag) {
+            .Unsupported => return printError(io, "session \"{s}\" does not support agent events (daemon too old?)", .{sesh}),
+            .AgentStateData => {
+                try stdout.interface.print("{s}\n", .{msg.payload});
+                try stdout.interface.flush();
+            },
+            else => {},
+        };
+    }
 }
 
 /// `zmx agent status`: the session's latest presence per agent.

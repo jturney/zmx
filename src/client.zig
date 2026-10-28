@@ -188,7 +188,7 @@ pub fn attach(alloc: Allocator, io: Io, name: []const u8, opts: AttachOptions) !
     _ = try lib_posix.write(lib_posix.STDOUT_FILENO, clear_seq);
 
     const env_str = opts.tracked_env orelse "";
-    const looper = try loop.clientLoop(client_sock, env_str);
+    const looper = try loop.clientLoop(io, client_sock, env_str, sesh);
     switch (looper.kind) {
         .detach => return,
         .switch_session => {

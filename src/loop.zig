@@ -6,6 +6,7 @@ const cross = @import("cross");
 const socket = @import("socket.zig");
 const label = @import("label.zig");
 const agent = @import("agent.zig");
+const agent_reply = @import("agent_reply.zig");
 const lib_posix = @import("posix.zig");
 const Cfg = @import("cfg.zig");
 const signal = @import("signal.zig");
@@ -17,7 +18,7 @@ const ghostty_vt = terminal.ghostty_vt;
 
 /// clientLoop sends ipc commands to its corresponding daemon.  It uses poll() as its non-blocking
 /// mechanism. It will send stdin to the daemon and receive stdout from the daemon.
-pub fn clientLoop(client_sock_fd: i32, env_str: []const u8) !ClientResult {
+pub fn clientLoop(io: std.Io, client_sock_fd: i32, env_str: []const u8, session_name: []const u8) !ClientResult {
     std.log.info("client loop fd={d}", .{client_sock_fd});
     const gpa: std.mem.Allocator = blk: {
         if (builtin.mode == .debug) {
@@ -72,6 +73,23 @@ pub fn clientLoop(client_sock_fd: i32, env_str: []const u8) !ClientResult {
 
     const detach_key_disabled = util.isDetachKeyDisabled();
 
+    // Agent replies typed into this terminal (see agent_reply.zig). A reply
+    // names its session by base64, so this session's name is compared that way.
+    const encoder = std.base64.standard.Encoder;
+    const sess_b64 = try gpa.alloc(u8, encoder.calcSize(session_name.len));
+    defer gpa.free(sess_b64);
+    _ = encoder.encode(sess_b64, session_name);
+    var reply_scanner: agent_reply.Scanner = .{};
+    defer reply_scanner.deinit(gpa);
+    var scan_items: std.ArrayList(agent_reply.Scanner.Item) = .empty;
+    defer scan_items.deinit(gpa);
+    // Asks the daemon has announced and not yet resolved; a reply to anything
+    // else is forwarded, since it may be for a session further downstream.
+    var pending_rids: std.ArrayList(u32) = .empty;
+    defer pending_rids.deinit(gpa);
+    var hold_deadline_ms: ?i64 = null;
+    var hold_timeout_ms: ?i32 = null;
+
     while (true) {
         poll_fds.clearRetainingCapacity();
 
@@ -102,7 +120,22 @@ pub fn clientLoop(client_sock_fd: i32, env_str: []const u8) !ClientResult {
             });
         }
 
-        _ = try lib_posix.poll(poll_fds.items, -1);
+        const poll_timeout: i32 = if (hold_deadline_ms) |deadline|
+            @intCast(std.math.clamp(deadline - std.Io.Timestamp.now(io, .awake).toMilliseconds(), 0, std.math.maxInt(i32)))
+        else
+            -1;
+        _ = try lib_posix.poll(poll_fds.items, poll_timeout);
+
+        // A partial reply held too long was ordinary input after all (a lone
+        // Esc keypress, most often).
+        if (hold_deadline_ms) |deadline| {
+            if (std.Io.Timestamp.now(io, .awake).toMilliseconds() >= deadline) {
+                const held = reply_scanner.flush();
+                if (held.len > 0) try ipc.appendMessage(gpa, &sock_write_buf, .Input, held);
+                hold_deadline_ms = null;
+                hold_timeout_ms = null;
+            }
+        }
 
         if (poll_fds.items[2].revents & lib_posix.POLL.IN != 0) {
             signal.drainSignalPipe();
@@ -131,7 +164,20 @@ pub fn clientLoop(client_sock_fd: i32, env_str: []const u8) !ClientResult {
                         std.log.info("detach key detected", .{});
                         try ipc.appendMessage(gpa, &sock_write_buf, .Detach, "");
                     } else {
-                        try ipc.appendMessage(gpa, &sock_write_buf, .Input, buf[0..n]);
+                        scan_items.clearRetainingCapacity();
+                        try reply_scanner.feed(gpa, buf[0..n], &scan_items);
+                        for (scan_items.items) |item| switch (item) {
+                            .input => |bytes| try ipc.appendMessage(gpa, &sock_write_buf, .Input, bytes),
+                            .reply => |reply| try routeAgentReply(gpa, &sock_write_buf, reply, sess_b64, pending_rids.items),
+                        };
+                        reply_scanner.clearReleased(gpa);
+                        // Start (or restart, when the hold changes kind) the
+                        // clock on held bytes.
+                        const timeout = reply_scanner.holdTimeoutMs();
+                        if (timeout != hold_timeout_ms) {
+                            hold_timeout_ms = timeout;
+                            hold_deadline_ms = if (timeout) |t| std.Io.Timestamp.now(io, .awake).toMilliseconds() + t else null;
+                        }
                     }
                 } else {
                     std.log.info("eof stdin", .{});
@@ -174,6 +220,18 @@ pub fn clientLoop(client_sock_fd: i32, env_str: []const u8) !ClientResult {
                             .Resize,
                             std.mem.asBytes(&next_size),
                         );
+                    },
+                    .AgentPending => {
+                        const rid = agentRid(gpa, msg.payload) orelse continue;
+                        if (std.mem.indexOfScalar(u32, pending_rids.items, rid) == null) {
+                            // Bounded: the daemon caps pending asks far below this.
+                            if (pending_rids.items.len >= 64) _ = pending_rids.orderedRemove(0);
+                            try pending_rids.append(gpa, rid);
+                        }
+                    },
+                    .AgentResolved => {
+                        const rid = agentRid(gpa, msg.payload) orelse continue;
+                        if (std.mem.indexOfScalar(u32, pending_rids.items, rid)) |at| _ = pending_rids.orderedRemove(at);
                     },
                     .Switch => {
                         std.log.info("switch session", .{});
@@ -225,6 +283,46 @@ pub fn clientLoop(client_sock_fd: i32, env_str: []const u8) !ClientResult {
             return ClientResult{ .kind = .detach, .session_name = null };
         }
     }
+}
+
+/// The `rid` of an `AgentPending` / `AgentResolved` payload.
+fn agentRid(gpa: std.mem.Allocator, payload: []const u8) ?u32 {
+    const parsed = std.json.parseFromSlice(struct { rid: u32 }, gpa, payload, .{ .ignore_unknown_fields = true }) catch return null;
+    defer parsed.deinit();
+    return parsed.value.rid;
+}
+
+/// Sends a reply for one of this session's pending asks to the daemon, and
+/// forwards any other reply untouched as input for a session downstream.
+fn routeAgentReply(
+    gpa: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    reply: agent_reply.Reply,
+    sess_b64: []const u8,
+    pending_rids: []const u32,
+) !void {
+    const ours = std.mem.eql(u8, reply.sess, sess_b64) and std.mem.indexOfScalar(u32, pending_rids, reply.rid) != null;
+    if (!ours) return ipc.appendMessage(gpa, out, .Input, reply.raw);
+
+    const decoder = std.base64.standard.Decoder;
+    const size = decoder.calcSizeForSlice(reply.decision) catch return logBadReply(reply.rid);
+    const decision = try gpa.alloc(u8, size);
+    defer gpa.free(decision);
+    decoder.decode(decision, reply.decision) catch return logBadReply(reply.rid);
+    if (!(std.json.validate(gpa, decision) catch false)) return logBadReply(reply.rid);
+    const payload = try std.fmt.allocPrint(
+        gpa,
+        "{{\"rid\":{d},\"nonce\":\"{s}\",\"decision\":{s}}}",
+        .{ reply.rid, reply.nonce, decision },
+    );
+    defer gpa.free(payload);
+    try ipc.appendMessage(gpa, out, .AgentReply, payload);
+}
+
+/// A reply for this session with an unreadable decision is consumed, not
+/// forwarded: it is addressed here, and the PTY must never see it.
+fn logBadReply(rid: u32) void {
+    std.log.warn("dropping agent reply with an unreadable decision rid={d}", .{rid});
 }
 
 fn initTerminal(gpa: std.mem.Allocator, io: std.Io, size: ipc.Resize, cfg: *const Cfg) !ghostty_vt.Terminal {
@@ -302,7 +400,9 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
             });
         }
 
-        _ = try lib_posix.poll(poll_fds.items, -1);
+        // Wake for the next ask deadline, if any.
+        _ = try lib_posix.poll(poll_fds.items, daemon.nextAskTimeoutMs(io));
+        daemon.expireAsks(gpa, io);
 
         if (poll_fds.items[2].revents & lib_posix.POLL.IN != 0) {
             signal.drainSignalPipe();
@@ -506,8 +606,20 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                         .Capture => try daemon.handleCapture(gpa, client, &term, msg.payload),
                         .Run => try daemon.handleRun(gpa, io, client, msg.payload),
                         .AgentNotify => try daemon.handleAgentNotify(gpa, io, client, msg.payload),
+                        .AgentAsk => try daemon.handleAgentAsk(gpa, io, client, msg.payload),
+                        .AgentReply => try daemon.handleAgentReply(gpa, client, msg.payload),
                         .AgentStateGet => try daemon.handleAgentStateGet(gpa, client),
-                        .Ack, .TaskComplete, .LabelData, .EnvData, .AgentStateData, .Unsupported => {},
+                        .AgentSubscribe => try daemon.handleAgentSubscribe(gpa, client),
+                        .Ack,
+                        .TaskComplete,
+                        .LabelData,
+                        .EnvData,
+                        .AgentPending,
+                        .AgentResolved,
+                        .AgentDecision,
+                        .AgentStateData,
+                        .Unsupported,
+                        => {},
                         .Write => try daemon.handleWrite(gpa, client, msg.payload),
                         _ => {
                             std.log.warn(
@@ -606,6 +718,11 @@ pub const Daemon = struct {
     labels: std.StringHashMapUnmanaged([]u8) = .empty,
     /// Latest agent presence per agent, replayed to each client that attaches.
     agents: agent.Store = .{},
+    /// Asks waiting for a reply, oldest first.
+    asks: std.ArrayList(agent.PendingAsk) = .empty,
+    next_rid: u32 = 1,
+    /// Connections streaming agent events (`zmx agent events`).
+    subscribers: std.ArrayList(i32) = .empty,
     // This control which client is the leader.  The leader controls terminal state and
     // cols/rows of session.
     leader_client_fd: ?i32 = null,
@@ -654,6 +771,9 @@ pub const Daemon = struct {
         }
         self.labels.deinit(gpa);
         self.agents.deinit(gpa);
+        for (self.asks.items) |ask| ask.deinit(gpa);
+        self.asks.deinit(gpa);
+        self.subscribers.deinit(gpa);
         self.pty_write_buf.deinit(gpa);
         gpa.free(self.socket_path);
     }
@@ -697,6 +817,19 @@ pub const Daemon = struct {
                 .{ self.session_name, client.socket_fd },
             );
             self.leader_client_fd = null;
+        }
+        // An asker that goes away (the agent killed its hook) takes its asks
+        // with it; there is no one left to tell.
+        var k = self.asks.items.len;
+        while (k > 0) {
+            k -= 1;
+            if (self.asks.items[k].asker_fd == fd) self.resolveAsk(gpa, k, .cancelled, null);
+        }
+        for (self.subscribers.items, 0..) |sub_fd, j| {
+            if (sub_fd == fd) {
+                _ = self.subscribers.swapRemove(j);
+                break;
+            }
         }
         client.deinit(gpa);
         gpa.destroy(client);
@@ -1025,6 +1158,13 @@ pub const Daemon = struct {
         // Agent presence is an event, not screen state, so the snapshot can't
         // carry it; replay it after the snapshot so it lands on top.
         if (try self.agents.appendReplay(gpa, &client.write_buf)) {
+            client.has_pending_output = true;
+        }
+        for (self.asks.items) |*ask| {
+            try ipc.appendMessage(gpa, &client.write_buf, .Output, ask.osc);
+            const pending = try pendingJson(gpa, ask);
+            defer gpa.free(pending);
+            try ipc.appendMessage(gpa, &client.write_buf, .AgentPending, pending);
             client.has_pending_output = true;
         }
 
@@ -1377,21 +1517,229 @@ pub const Daemon = struct {
         if (event.kind == .presence) {
             const now = std.Io.Timestamp.now(io, .real).toSeconds();
             try self.agents.record(gpa, event.agent, event.event.?, event.pid, now);
+            // The agent has moved past whatever it asked: a prompt answered in
+            // the terminal leaves the hook blocked until its timeout, so its
+            // asks would otherwise linger. Not `busy` or `awaiting_input`,
+            // which other hooks of the same tool call send alongside an ask.
+            switch (event.event.?) {
+                .idle, .@"error", .session_end => self.cancelAgentAsks(gpa, event.agent),
+                else => {},
+            }
         }
         const osc = try agent.render(gpa, event);
         defer gpa.free(osc);
+        self.broadcastToTerminals(gpa, .Output, osc);
+        const json = switch (event.kind) {
+            .presence => try std.json.Stringify.valueAlloc(
+                gpa,
+                .{ .type = "presence", .agent = event.agent, .event = event.event.?, .pid = event.pid },
+                .{},
+            ),
+            .notify => try std.json.Stringify.valueAlloc(
+                gpa,
+                .{ .type = "notify", .agent = event.agent, .title = event.title orelse "", .body = event.body orelse "" },
+                .{},
+            ),
+        };
+        defer gpa.free(json);
+        self.publishEvent(gpa, json);
+    }
+
+    /// Holds a request until a terminal answers it, it times out, or the
+    /// asker disconnects. The asker hears back only through `AgentDecision`.
+    fn handleAgentAsk(self: *Daemon, gpa: std.mem.Allocator, io: std.Io, client: *Client, payload: []const u8) !void {
+        if (payload.len > agent.max_ask_payload) return sendDecision(gpa, client, 0, .invalid);
+        const parsed = std.json.parseFromSlice(agent.AskRequest, gpa, payload, .{ .ignore_unknown_fields = true }) catch {
+            return sendDecision(gpa, client, 0, .invalid);
+        };
+        defer parsed.deinit();
+        const req = parsed.value;
+        agent.validateAsk(req) catch |err| {
+            std.log.warn("refusing agent ask: {s}", .{@errorName(err)});
+            return sendDecision(gpa, client, 0, .invalid);
+        };
+        if (self.asks.items.len >= agent.max_pending_asks) return sendDecision(gpa, client, 0, .busy);
+
+        const rid = self.next_rid;
+        self.next_rid +%= 1;
+        if (self.next_rid == 0) self.next_rid = 1;
+        var nonce: [16]u8 = undefined;
+        io.randomSecure(&nonce) catch io.random(&nonce);
+        const nonce_hex = std.fmt.bytesToHex(nonce, .lower);
+        const detail_json = if (req.detail) |d| try std.json.Stringify.valueAlloc(gpa, d, .{}) else try gpa.dupe(u8, "");
+        defer gpa.free(detail_json);
+        const now = std.Io.Timestamp.now(io, .real).toMilliseconds();
+        const timeout: i64 = @intCast(std.math.clamp(req.timeout_ms, agent.min_ask_timeout_ms, agent.max_ask_timeout_ms));
+
+        const osc = try agent.renderAsk(gpa, req.agent, rid, &nonce_hex, self.session_name, req.type, req.title, req.summary, detail_json);
+        errdefer gpa.free(osc);
+        const owned_agent = try gpa.dupe(u8, req.agent);
+        errdefer gpa.free(owned_agent);
+        const title = try gpa.dupe(u8, req.title);
+        errdefer gpa.free(title);
+        const summary = try gpa.dupe(u8, req.summary);
+        errdefer gpa.free(summary);
+        try self.asks.append(gpa, .{
+            .rid = rid,
+            .nonce = nonce,
+            .asker_fd = client.socket_fd,
+            .agent = owned_agent,
+            .type = req.type,
+            .title = title,
+            .summary = summary,
+            .created_ms = now,
+            .deadline_ms = now + timeout,
+            .osc = osc,
+        });
+        const ask = &self.asks.items[self.asks.items.len - 1];
+        std.log.info("agent ask rid={d} type={t}", .{ rid, req.type });
+
+        self.broadcastToTerminals(gpa, .Output, osc);
+        const pending = try pendingJson(gpa, ask);
+        defer gpa.free(pending);
+        self.broadcastToTerminals(gpa, .AgentPending, pending);
+        const event = try askEventJson(gpa, ask);
+        defer gpa.free(event);
+        self.publishEvent(gpa, event);
+    }
+
+    /// Answers an ask. The first valid reply wins; a later one, or one with
+    /// the wrong nonce, is told the rid is unknown either way, so a guess
+    /// learns nothing.
+    fn handleAgentReply(self: *Daemon, gpa: std.mem.Allocator, client: *Client, payload: []const u8) !void {
+        const Reply = struct { rid: u32, nonce: []const u8, decision: std.json.Value };
+        const parsed = std.json.parseFromSlice(Reply, gpa, payload, .{ .ignore_unknown_fields = true }) catch {
+            return ackReply(gpa, client, "invalid reply");
+        };
+        defer parsed.deinit();
+        const reply = parsed.value;
+        const index = for (self.asks.items, 0..) |ask, i| {
+            if (ask.rid == reply.rid) break i;
+        } else return ackReply(gpa, client, "unknown rid");
+        if (!self.asks.items[index].nonceMatches(reply.nonce)) {
+            std.log.warn("rejecting agent reply with a wrong nonce rid={d}", .{reply.rid});
+            return ackReply(gpa, client, "unknown rid");
+        }
+
+        const decision = try std.json.Stringify.valueAlloc(gpa, reply.decision, .{});
+        defer gpa.free(decision);
+        if (self.clientByFd(self.asks.items[index].asker_fd)) |asker| {
+            const out = try std.fmt.allocPrint(gpa, "{{\"rid\":{d},\"outcome\":\"answered\",\"decision\":{s}}}", .{ reply.rid, decision });
+            defer gpa.free(out);
+            try ipc.appendMessage(gpa, &asker.write_buf, .AgentDecision, out);
+            asker.has_pending_output = true;
+        }
+        std.log.info("agent ask answered rid={d}", .{reply.rid});
+        self.resolveAsk(gpa, index, .answered, null);
+        return ackReply(gpa, client, null);
+    }
+
+    fn handleAgentStateGet(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !void {
+        const out = try self.agents.stateJson(gpa, self.session_name, self.asks.items);
+        defer gpa.free(out);
+        try ipc.appendMessage(gpa, &client.write_buf, .AgentStateData, out);
+        client.has_pending_output = true;
+    }
+
+    /// Streams agent events to `client` until it disconnects, starting with
+    /// the current presence and pending asks. Asks carry their nonce, so a UI
+    /// outside the terminal can answer them; this is same-user access, like
+    /// everything else on the socket.
+    fn handleAgentSubscribe(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !void {
+        for (self.subscribers.items) |fd| {
+            if (fd == client.socket_fd) return;
+        }
+        try self.subscribers.append(gpa, client.socket_fd);
+        for (self.agents.entries.items) |entry| {
+            const json = try std.json.Stringify.valueAlloc(
+                gpa,
+                .{ .type = "presence", .agent = entry.agent, .event = entry.event, .pid = entry.pid },
+                .{},
+            );
+            defer gpa.free(json);
+            try ipc.appendMessage(gpa, &client.write_buf, .AgentStateData, json);
+        }
+        for (self.asks.items) |*ask| {
+            const json = try askEventJson(gpa, ask);
+            defer gpa.free(json);
+            try ipc.appendMessage(gpa, &client.write_buf, .AgentStateData, json);
+        }
+        client.has_pending_output = true;
+    }
+
+    /// Removes an ask and tells everyone it is gone. `outcome` is sent to the
+    /// asker when it is still listening.
+    fn resolveAsk(self: *Daemon, gpa: std.mem.Allocator, index: usize, why: agent.ResolveReason, outcome: ?agent.Outcome) void {
+        const ask = self.asks.orderedRemove(index);
+        defer ask.deinit(gpa);
+        if (outcome) |o| {
+            if (self.clientByFd(ask.asker_fd)) |asker| sendDecision(gpa, asker, ask.rid, o) catch {};
+        }
+        if (agent.renderResolved(gpa, ask.agent, ask.rid, why)) |osc| {
+            defer gpa.free(osc);
+            self.broadcastToTerminals(gpa, .Output, osc);
+        } else |_| {}
+        var buf: [32]u8 = undefined;
+        if (std.fmt.bufPrint(&buf, "{{\"rid\":{d}}}", .{ask.rid})) |resolved| {
+            self.broadcastToTerminals(gpa, .AgentResolved, resolved);
+        } else |_| {}
+        if (std.json.Stringify.valueAlloc(gpa, .{ .type = "resolved", .rid = ask.rid, .why = why }, .{})) |event| {
+            defer gpa.free(event);
+            self.publishEvent(gpa, event);
+        } else |_| {}
+    }
+
+    fn cancelAgentAsks(self: *Daemon, gpa: std.mem.Allocator, agent_name: []const u8) void {
+        var k = self.asks.items.len;
+        while (k > 0) {
+            k -= 1;
+            if (std.mem.eql(u8, self.asks.items[k].agent, agent_name)) self.resolveAsk(gpa, k, .cancelled, .cancelled);
+        }
+    }
+
+    /// Milliseconds until the next ask deadline, or -1 (no timeout) with none.
+    pub fn nextAskTimeoutMs(self: *const Daemon, io: std.Io) i32 {
+        if (self.asks.items.len == 0) return -1;
+        var next = self.asks.items[0].deadline_ms;
+        for (self.asks.items[1..]) |ask| next = @min(next, ask.deadline_ms);
+        const now = std.Io.Timestamp.now(io, .real).toMilliseconds();
+        return @intCast(std.math.clamp(next - now, 0, std.math.maxInt(i32)));
+    }
+
+    pub fn expireAsks(self: *Daemon, gpa: std.mem.Allocator, io: std.Io) void {
+        if (self.asks.items.len == 0) return;
+        const now = std.Io.Timestamp.now(io, .real).toMilliseconds();
+        var k = self.asks.items.len;
+        while (k > 0) {
+            k -= 1;
+            if (self.asks.items[k].deadline_ms <= now) {
+                std.log.info("agent ask timed out rid={d}", .{self.asks.items[k].rid});
+                self.resolveAsk(gpa, k, .timeout, .timeout);
+            }
+        }
+    }
+
+    fn clientByFd(self: *Daemon, fd: i32) ?*Client {
+        for (self.clients.items) |c| {
+            if (c.socket_fd == fd) return c;
+        }
+        return null;
+    }
+
+    fn broadcastToTerminals(self: *Daemon, gpa: std.mem.Allocator, tag: ipc.Tag, payload: []const u8) void {
         for (self.clients.items) |c| {
             if (!c.is_terminal) continue;
-            try ipc.appendMessage(gpa, &c.write_buf, .Output, osc);
+            ipc.appendMessage(gpa, &c.write_buf, tag, payload) catch continue;
             c.has_pending_output = true;
         }
     }
 
-    fn handleAgentStateGet(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !void {
-        const out = try self.agents.stateJson(gpa, self.session_name);
-        defer gpa.free(out);
-        try ipc.appendMessage(gpa, &client.write_buf, .AgentStateData, out);
-        client.has_pending_output = true;
+    fn publishEvent(self: *Daemon, gpa: std.mem.Allocator, json: []const u8) void {
+        for (self.subscribers.items) |fd| {
+            const c = self.clientByFd(fd) orelse continue;
+            ipc.appendMessage(gpa, &c.write_buf, .AgentStateData, json) catch continue;
+            c.has_pending_output = true;
+        }
     }
 
     fn handleLabelGet(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !void {
@@ -1466,6 +1814,43 @@ test "terminal retains the configured scrollback without the default byte cap" {
     defer alloc.free(pruned_history);
     try std.testing.expect(std.mem.indexOf(u8, pruned_history, "first line") == null);
     try std.testing.expect(std.mem.indexOf(u8, pruned_history, "latest line") != null);
+}
+
+fn sendDecision(gpa: std.mem.Allocator, client: *Client, rid: u32, outcome: agent.Outcome) !void {
+    var buf: [64]u8 = undefined;
+    const out = try std.fmt.bufPrint(&buf, "{{\"rid\":{d},\"outcome\":\"{t}\"}}", .{ rid, outcome });
+    try ipc.appendMessage(gpa, &client.write_buf, .AgentDecision, out);
+    client.has_pending_output = true;
+}
+
+fn ackReply(gpa: std.mem.Allocator, client: *Client, err: ?[]const u8) !void {
+    const out = if (err) |e|
+        try std.json.Stringify.valueAlloc(gpa, .{ .ok = false, .@"error" = e }, .{})
+    else
+        try gpa.dupe(u8, "{\"ok\":true}");
+    defer gpa.free(out);
+    try ipc.appendMessage(gpa, &client.write_buf, .Ack, out);
+    client.has_pending_output = true;
+}
+
+fn pendingJson(gpa: std.mem.Allocator, ask: *const agent.PendingAsk) ![]u8 {
+    const nonce = ask.nonceHex();
+    return std.json.Stringify.valueAlloc(gpa, .{ .rid = ask.rid, .nonce = &nonce }, .{});
+}
+
+fn askEventJson(gpa: std.mem.Allocator, ask: *const agent.PendingAsk) ![]u8 {
+    const nonce = ask.nonceHex();
+    return std.json.Stringify.valueAlloc(gpa, .{
+        .type = "ask",
+        .rid = ask.rid,
+        .nonce = &nonce,
+        .agent = ask.agent,
+        .ask_type = ask.type,
+        .title = ask.title,
+        .summary = ask.summary,
+        .created_ms = ask.created_ms,
+        .deadline_ms = ask.deadline_ms,
+    }, .{});
 }
 
 fn testDaemon() Daemon {
@@ -1614,6 +1999,153 @@ test "agent notify reaches attached terminals only, and presence replays on atta
     const replay_at = std.mem.indexOf(u8, late.write_buf.items, busy) orelse return error.TestUnexpectedResult;
     const snapshot_at = std.mem.indexOf(u8, late.write_buf.items, "prompt$") orelse return error.TestUnexpectedResult;
     try std.testing.expect(snapshot_at < replay_at);
+}
+
+/// A test client on a pipe; its deinit closes the read end.
+const TestPeer = struct {
+    client: *Client,
+    write_fd: i32,
+
+    fn init(alloc: std.mem.Allocator, is_terminal: bool) !TestPeer {
+        const fds = try lib_posix.pipe2(.{});
+        return .{ .client = try testClient(alloc, fds[0], is_terminal), .write_fd = fds[1] };
+    }
+
+    fn deinit(self: TestPeer, alloc: std.mem.Allocator) void {
+        self.client.deinit(alloc);
+        alloc.destroy(self.client);
+        lib_posix.close(self.write_fd);
+    }
+
+    /// The payload of the last frame tagged `tag` in this client's outbox.
+    fn lastFrame(self: TestPeer, tag: ipc.Tag) ?[]const u8 {
+        var found: ?[]const u8 = null;
+        var rest = self.client.write_buf.items;
+        while (rest.len >= @sizeOf(ipc.Header)) {
+            const header = std.mem.bytesToValue(ipc.Header, rest[0..@sizeOf(ipc.Header)]);
+            const end = @sizeOf(ipc.Header) + header.len;
+            if (header.tag == tag) found = rest[@sizeOf(ipc.Header)..end];
+            rest = rest[end..];
+        }
+        return found;
+    }
+};
+
+test "agent ask: answered by the first valid reply, refused with a wrong nonce" {
+    const alloc = std.testing.allocator;
+    var daemon = testDaemon();
+    defer daemon.clients.deinit(alloc);
+    defer daemon.pty_write_buf.deinit(alloc);
+    defer daemon.agents.deinit(alloc);
+    defer daemon.asks.deinit(alloc);
+    defer daemon.subscribers.deinit(alloc);
+
+    const viewer = try TestPeer.init(alloc, true);
+    defer viewer.deinit(alloc);
+    const asker = try TestPeer.init(alloc, false);
+    defer asker.deinit(alloc);
+    const replier = try TestPeer.init(alloc, false);
+    defer replier.deinit(alloc);
+    try daemon.clients.appendSlice(alloc, &.{ viewer.client, asker.client, replier.client });
+
+    try daemon.handleAgentAsk(alloc, std.testing.io, asker.client, "{\"type\":\"permission\",\"title\":\"Bash\",\"summary\":\"make\"}");
+    try std.testing.expectEqual(@as(usize, 1), daemon.asks.items.len);
+    const ask = daemon.asks.items[0];
+    const nonce = ask.nonceHex();
+    // The viewer sees the ask; the asker hears nothing yet.
+    try std.testing.expect(std.mem.indexOf(u8, viewer.client.write_buf.items, "kind=ask;rid=1;nonce=") != null);
+    try std.testing.expect(viewer.lastFrame(.AgentPending) != null);
+    try std.testing.expect(asker.lastFrame(.AgentDecision) == null);
+
+    try daemon.handleAgentReply(alloc, replier.client, "{\"rid\":1,\"nonce\":\"00000000000000000000000000000000\",\"decision\":{\"behavior\":\"allow\"}}");
+    try std.testing.expectEqualStrings("{\"ok\":false,\"error\":\"unknown rid\"}", replier.lastFrame(.Ack).?);
+    try std.testing.expectEqual(@as(usize, 1), daemon.asks.items.len);
+
+    const good = try std.fmt.allocPrint(alloc, "{{\"rid\":1,\"nonce\":\"{s}\",\"decision\":{{\"behavior\":\"allow\"}}}}", .{&nonce});
+    defer alloc.free(good);
+    try daemon.handleAgentReply(alloc, replier.client, good);
+    try std.testing.expectEqualStrings("{\"ok\":true}", replier.lastFrame(.Ack).?);
+    try std.testing.expectEqualStrings(
+        "{\"rid\":1,\"outcome\":\"answered\",\"decision\":{\"behavior\":\"allow\"}}",
+        asker.lastFrame(.AgentDecision).?,
+    );
+    try std.testing.expectEqual(@as(usize, 0), daemon.asks.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, viewer.client.write_buf.items, "kind=resolved;rid=1;why=answered") != null);
+    try std.testing.expectEqualStrings("{\"rid\":1}", viewer.lastFrame(.AgentResolved).?);
+
+    // A second reply finds nothing.
+    try daemon.handleAgentReply(alloc, replier.client, good);
+    try std.testing.expectEqualStrings("{\"ok\":false,\"error\":\"unknown rid\"}", replier.lastFrame(.Ack).?);
+}
+
+test "agent ask: timeout, asker disconnect, and the agent moving on end it" {
+    const alloc = std.testing.allocator;
+    var daemon = testDaemon();
+    defer daemon.clients.deinit(alloc);
+    defer daemon.pty_write_buf.deinit(alloc);
+    defer daemon.agents.deinit(alloc);
+    defer daemon.asks.deinit(alloc);
+    defer daemon.subscribers.deinit(alloc);
+
+    const viewer = try TestPeer.init(alloc, true);
+    defer viewer.deinit(alloc);
+    const asker = try TestPeer.init(alloc, false);
+    defer asker.deinit(alloc);
+    try daemon.clients.appendSlice(alloc, &.{ viewer.client, asker.client });
+
+    // Timeout.
+    try daemon.handleAgentAsk(alloc, std.testing.io, asker.client, "{\"type\":\"question\",\"timeout_ms\":1000}");
+    try std.testing.expect(daemon.nextAskTimeoutMs(std.testing.io) > 0);
+    daemon.asks.items[0].deadline_ms = 0;
+    try std.testing.expectEqual(@as(i32, 0), daemon.nextAskTimeoutMs(std.testing.io));
+    daemon.expireAsks(alloc, std.testing.io);
+    try std.testing.expectEqual(@as(usize, 0), daemon.asks.items.len);
+    try std.testing.expectEqualStrings("{\"rid\":1,\"outcome\":\"timeout\"}", asker.lastFrame(.AgentDecision).?);
+    try std.testing.expectEqual(@as(i32, -1), daemon.nextAskTimeoutMs(std.testing.io));
+
+    // The agent moved on: `busy` and `awaiting_input` (sent alongside an ask)
+    // leave it, `idle` cancels it.
+    try daemon.handleAgentAsk(alloc, std.testing.io, asker.client, "{\"type\":\"permission\"}");
+    try daemon.handleAgentNotify(alloc, std.testing.io, asker.client, "{\"agent\":\"claude\",\"kind\":\"presence\",\"event\":\"busy\"}");
+    try daemon.handleAgentNotify(alloc, std.testing.io, asker.client, "{\"agent\":\"claude\",\"kind\":\"presence\",\"event\":\"awaiting_input\"}");
+    try daemon.handleAgentNotify(alloc, std.testing.io, asker.client, "{\"agent\":\"codex\",\"kind\":\"presence\",\"event\":\"idle\"}");
+    try std.testing.expectEqual(@as(usize, 1), daemon.asks.items.len);
+    try daemon.handleAgentNotify(alloc, std.testing.io, asker.client, "{\"agent\":\"claude\",\"kind\":\"presence\",\"event\":\"idle\"}");
+    try std.testing.expectEqual(@as(usize, 0), daemon.asks.items.len);
+    try std.testing.expectEqualStrings("{\"rid\":2,\"outcome\":\"cancelled\"}", asker.lastFrame(.AgentDecision).?);
+
+    // The asker goes away (the agent killed its hook). closeClient frees it.
+    const fds = try lib_posix.pipe2(.{});
+    defer lib_posix.close(fds[1]);
+    const leaving = try testClient(alloc, fds[0], false);
+    try daemon.clients.append(alloc, leaving);
+    try daemon.handleAgentAsk(alloc, std.testing.io, leaving, "{\"type\":\"permission\"}");
+    viewer.client.write_buf.clearRetainingCapacity();
+    _ = daemon.closeClient(alloc, leaving, daemon.clients.items.len - 1, false);
+    try std.testing.expectEqual(@as(usize, 0), daemon.asks.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, viewer.client.write_buf.items, "kind=resolved;rid=3;why=cancelled") != null);
+}
+
+test "agent ask: refused when invalid or when too many are pending" {
+    const alloc = std.testing.allocator;
+    var daemon = testDaemon();
+    defer daemon.clients.deinit(alloc);
+    defer daemon.pty_write_buf.deinit(alloc);
+    defer daemon.agents.deinit(alloc);
+    defer {
+        for (daemon.asks.items) |ask| ask.deinit(alloc);
+        daemon.asks.deinit(alloc);
+    }
+    defer daemon.subscribers.deinit(alloc);
+    const asker = try TestPeer.init(alloc, false);
+    defer asker.deinit(alloc);
+    try daemon.clients.append(alloc, asker.client);
+
+    try daemon.handleAgentAsk(alloc, std.testing.io, asker.client, "{\"type\":\"dance\"}");
+    try std.testing.expectEqualStrings("{\"rid\":0,\"outcome\":\"invalid\"}", asker.lastFrame(.AgentDecision).?);
+    for (0..agent.max_pending_asks) |_| try daemon.handleAgentAsk(alloc, std.testing.io, asker.client, "{\"type\":\"permission\"}");
+    try daemon.handleAgentAsk(alloc, std.testing.io, asker.client, "{\"type\":\"permission\"}");
+    try std.testing.expectEqualStrings("{\"rid\":0,\"outcome\":\"busy\"}", asker.lastFrame(.AgentDecision).?);
 }
 
 test "send queues PTY input without changing leader" {
