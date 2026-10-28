@@ -35,7 +35,7 @@ const bash_completions =
     \\  cur="${COMP_WORDS[COMP_CWORD]}"
     \\  prev="${COMP_WORDS[COMP_CWORD-1]}"
     \\
-    \\  local commands="attach run send print write detach list kill history get set clear print-env wait tail completions version help"
+    \\  local commands="attach run send print write detach list kill history get set clear agent print-env wait tail completions version help"
     \\
     \\  if [[ $COMP_CWORD -eq 1 ]]; then
     \\    COMPREPLY=($(compgen -W "$commands" -- "$cur"))
@@ -96,6 +96,7 @@ const zsh_completions =
     \\        'get:Get session labels'
     \\        'set:Set session labels'
     \\        'clear:Clear all session labels'
+    \\        'agent:Report or show agent activity'
     \\        'print-env:Print tracked environment variables'
     \\        'version:Show version'
     \\        'help:Show help message'
@@ -163,6 +164,7 @@ const fish_completions =
     \\complete -c zmx -n "__fish_is_nth_token 1" -a get -d 'Get session labels'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a set -d 'Set session labels'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a clear -d 'Clear all session labels'
+    \\complete -c zmx -n "__fish_is_nth_token 1" -a agent -d 'Report or show agent activity'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a print-env -d 'Print tracked environment variables'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a help -d 'Show help message'
     \\
@@ -245,6 +247,11 @@ const nu_completions =
     \\
     \\export extern "zmx clear" [
     \\    name?: string@"nu-complete zmx sessions"
+    \\]
+    \\
+    \\export extern "zmx agent" [
+    \\    subcommand?: string
+    \\    ...args: string
     \\]
     \\
     \\export extern "zmx print-env" [
@@ -339,6 +346,7 @@ const yash_completions =
     \\    complete -P "$PREFIX" -D "Get session labels" get g
     \\    complete -P "$PREFIX" -D "Set session labels" set
     \\    complete -P "$PREFIX" -D "Clear all session labels" clear cl
+    \\    complete -P "$PREFIX" -D "Report or show agent activity" agent
     \\    complete -P "$PREFIX" -D "Print tracked environment variables" print-env
     \\    complete -P "$PREFIX" -D "Kill session and all attached clients" kill k
     \\    complete -P "$PREFIX" -D "Output session scrollback" history hi

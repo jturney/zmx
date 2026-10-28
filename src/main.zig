@@ -8,6 +8,7 @@ const completions = @import("completions.zig");
 const util = @import("util.zig");
 const socket = @import("socket.zig");
 const label = @import("label.zig");
+const agent = @import("agent.zig");
 const lib_posix = @import("posix.zig");
 const signal = @import("signal.zig");
 const Cfg = @import("cfg.zig");
@@ -108,6 +109,14 @@ pub fn main(init: std.process.Init) !void {
         const sesh = try socket.resolveSessionOrEnv(gpa, io, sesh_name);
         defer gpa.free(sesh);
         return labelClear(gpa, io, &cfg, sesh);
+    } else if (std.mem.eql(u8, cmd, "agent")) {
+        const sub = args.next() orelse {
+            return printError(io, "agent requires a subcommand (notify, status)", .{});
+        };
+        if (detectHelp(sub)) return help(io);
+        if (std.mem.eql(u8, sub, "notify")) return agentNotify(gpa, io, &cfg, &args);
+        if (std.mem.eql(u8, sub, "status")) return agentStatus(gpa, io, &cfg, &args);
+        return printError(io, "unknown agent subcommand \"{s}\" (notify, status)", .{sub});
     } else if (std.mem.eql(u8, cmd, "completions") or std.mem.eql(u8, cmd, "c")) {
         const arg = args.next() orelse {
             return printError(io, "completions requires a shell argument (bash, zsh, fish, nu, yash)", .{});
@@ -455,6 +464,9 @@ fn help(io: std.Io) !void {
         \\  [g]et <name>                                               Get session labels
         \\  set <name> k=v ...                                         Set session labels (k= to remove)
         \\  [cl]ear <name>                                             Clear all session labels
+        \\  agent notify [--session s] --event e [--agent a] [--pid n] Report agent presence (for agent hooks)
+        \\  agent notify [--session s] --title t [--body b]            Report an agent notification
+        \\  agent status [--session s] [--json]                        Show the session's agent presence
         \\  print-env [-s] <name> [key]                                Print tracked environment variables
         \\  [k]ill <name>... [--force]                                 Kill session and all attached clients
         \\  [hi]story <name> [--vt|--html] [--screen|--scrollback]     Output session scrollback
@@ -575,6 +587,18 @@ fn help(io: std.Io) !void {
         \\    zmx set next "$(zmx get prev)"  # set labels from other session
         \\    zmx list | grep project=zmx
         \\    zmx clear dev
+        \\
+        \\Agent events:
+        \\  A coding agent's hooks report what it is doing to the session they run
+        \\  in. The daemon forwards each report to attached terminals as OSC 3008
+        \\  and replays the latest presence per agent to clients that attach later.
+        \\  Outside a session, or on an older daemon, `agent notify` does nothing
+        \\  and still exits 0, so hooks can call it unconditionally.
+        \\
+        \\  Examples:
+        \\    zmx agent notify --event busy --agent claude
+        \\    zmx agent notify --title "Done" --body "Tests pass"
+        \\    zmx agent status --session dev --json
         \\
         \\Print-env:
         \\  Print tracked environment variables for the leader client of a session.
@@ -899,6 +923,111 @@ fn printLabelError(io: std.Io, session_name: []const u8, err: anyerror) noreturn
     }
     w.interface.flush() catch {};
     std.process.exit(1);
+}
+
+/// Warns on stderr without failing: `zmx agent notify` runs inside agent hooks,
+/// where a non-zero exit would surface as a hook error.
+fn agentWarn(io: std.Io, comptime fmt: []const u8, args: anytype) void {
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.File.stderr().writer(io, &buf);
+    w.interface.print("warning: " ++ fmt ++ "\n", args) catch {};
+    w.interface.flush() catch {};
+}
+
+/// `zmx agent notify`: report agent activity to a session's daemon. Always
+/// exits 0. Outside a session, or against a daemon that predates agent
+/// events, it does nothing, so hooks can call it unconditionally.
+fn agentNotify(gpa: std.mem.Allocator, io: std.Io, cfg: *Cfg, args: anytype) !void {
+    var session: ?[]const u8 = null;
+    var kind: ?agent.Kind = null;
+    var event: agent.Notify = .{ .agent = "claude", .kind = .presence };
+    while (args.next()) |arg| {
+        if (detectHelp(arg)) return help(io);
+        const value = args.next() orelse return agentWarn(io, "{s} requires a value", .{arg});
+        if (std.mem.eql(u8, arg, "--session")) {
+            session = value;
+        } else if (std.mem.eql(u8, arg, "--agent")) {
+            event.agent = value;
+        } else if (std.mem.eql(u8, arg, "--kind")) {
+            kind = std.meta.stringToEnum(agent.Kind, value) orelse
+                return agentWarn(io, "unknown --kind \"{s}\" (presence, notify)", .{value});
+        } else if (std.mem.eql(u8, arg, "--event")) {
+            event.event = std.meta.stringToEnum(agent.Event, value) orelse
+                return agentWarn(io, "unknown --event \"{s}\"", .{value});
+        } else if (std.mem.eql(u8, arg, "--pid")) {
+            event.pid = std.fmt.parseInt(i32, value, 10) catch
+                return agentWarn(io, "--pid must be a number, got \"{s}\"", .{value});
+        } else if (std.mem.eql(u8, arg, "--title")) {
+            event.title = value;
+        } else if (std.mem.eql(u8, arg, "--body")) {
+            event.body = value;
+        } else {
+            return agentWarn(io, "unknown agent notify option \"{s}\"", .{arg});
+        }
+    }
+    // A title or body without an event reads as a notification.
+    event.kind = kind orelse if (event.event == null and (event.title != null or event.body != null)) .notify else .presence;
+    agent.validate(event) catch |err| return agentWarn(io, "invalid agent event: {s}", .{@errorName(err)});
+
+    const sesh = socket.resolveSessionOrEnv(gpa, io, session) catch return;
+    defer gpa.free(sesh);
+    const socket_path = try socket.getSocketPath(gpa, cfg.socket_dir, sesh);
+    defer gpa.free(socket_path);
+    const payload = try std.json.Stringify.valueAlloc(gpa, event, .{ .emit_null_optional_fields = false });
+    defer gpa.free(payload);
+    const reply = ipc.roundTripForTag(gpa, socket_path, .AgentNotify, payload, .Ack) catch |err| {
+        std.log.debug("agent notify not delivered session={s} err={s}", .{ sesh, @errorName(err) });
+        return;
+    };
+    gpa.free(reply);
+}
+
+/// `zmx agent status`: the session's latest presence per agent.
+fn agentStatus(gpa: std.mem.Allocator, io: std.Io, cfg: *Cfg, args: anytype) !void {
+    var session: ?[]const u8 = null;
+    var as_json = false;
+    while (args.next()) |arg| {
+        if (detectHelp(arg)) return help(io);
+        if (std.mem.eql(u8, arg, "--json")) {
+            as_json = true;
+        } else if (std.mem.eql(u8, arg, "--session")) {
+            session = args.next() orelse return printError(io, "--session requires a value", .{});
+        } else {
+            return printError(io, "unknown agent status option \"{s}\"", .{arg});
+        }
+    }
+    const sesh = socket.resolveSessionOrEnv(gpa, io, session) catch {
+        return printError(io, "session name required (--session <name>, or run inside a zmx session)", .{});
+    };
+    defer gpa.free(sesh);
+    const socket_path = try socket.getSocketPath(gpa, cfg.socket_dir, sesh);
+    defer gpa.free(socket_path);
+    const payload = ipc.roundTripForTag(gpa, socket_path, .AgentStateGet, "", .AgentStateData) catch |err| switch (err) {
+        error.Unsupported => return printError(io, "session \"{s}\" does not support agent events (daemon too old?)", .{sesh}),
+        else => printLabelError(io, sesh, err),
+    };
+    defer gpa.free(payload);
+
+    var buf: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(io, &buf);
+    if (as_json) {
+        try stdout.interface.print("{s}\n", .{payload});
+        return stdout.interface.flush();
+    }
+    const State = struct {
+        agents: []const struct { agent: []const u8, event: agent.Event, pid: ?i32 = null, at: i64 },
+    };
+    const parsed = try std.json.parseFromSlice(State, gpa, payload, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    if (parsed.value.agents.len == 0) {
+        try stdout.interface.print("no agent activity\n", .{});
+    }
+    for (parsed.value.agents) |a| {
+        try stdout.interface.print("{s}\t{t}", .{ a.agent, a.event });
+        if (a.pid) |pid| try stdout.interface.print("\tpid={d}", .{pid});
+        try stdout.interface.print("\n", .{});
+    }
+    try stdout.interface.flush();
 }
 
 fn labelGet(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const u8, single_kv: []const u8) !void {

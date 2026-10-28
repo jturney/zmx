@@ -4,6 +4,7 @@ comptime {
     _ = @import("socket.zig");
     _ = @import("ipc.zig");
     _ = @import("label.zig");
+    _ = @import("agent.zig");
     _ = @import("signal.zig");
     _ = @import("loop.zig");
     _ = @import("terminal.zig");

@@ -5,6 +5,7 @@ const util = @import("util.zig");
 const cross = @import("cross");
 const socket = @import("socket.zig");
 const label = @import("label.zig");
+const agent = @import("agent.zig");
 const lib_posix = @import("posix.zig");
 const Cfg = @import("cfg.zig");
 const signal = @import("signal.zig");
@@ -504,7 +505,9 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                         .History => try daemon.handleHistory(gpa, client, &term, msg.payload),
                         .Capture => try daemon.handleCapture(gpa, client, &term, msg.payload),
                         .Run => try daemon.handleRun(gpa, io, client, msg.payload),
-                        .Ack, .TaskComplete, .LabelData, .EnvData, .Unsupported => {},
+                        .AgentNotify => try daemon.handleAgentNotify(gpa, io, client, msg.payload),
+                        .AgentStateGet => try daemon.handleAgentStateGet(gpa, client),
+                        .Ack, .TaskComplete, .LabelData, .EnvData, .AgentStateData, .Unsupported => {},
                         .Write => try daemon.handleWrite(gpa, client, msg.payload),
                         _ => {
                             std.log.warn(
@@ -601,6 +604,8 @@ pub const Daemon = struct {
     pty_write_buf: std.ArrayList(u8) = .empty,
     clients: std.ArrayList(*Client) = .empty,
     labels: std.StringHashMapUnmanaged([]u8) = .empty,
+    /// Latest agent presence per agent, replayed to each client that attaches.
+    agents: agent.Store = .{},
     // This control which client is the leader.  The leader controls terminal state and
     // cols/rows of session.
     leader_client_fd: ?i32 = null,
@@ -648,6 +653,7 @@ pub const Daemon = struct {
             gpa.free(entry.value_ptr.*);
         }
         self.labels.deinit(gpa);
+        self.agents.deinit(gpa);
         self.pty_write_buf.deinit(gpa);
         gpa.free(self.socket_path);
     }
@@ -1016,6 +1022,12 @@ pub const Daemon = struct {
             }
         }
 
+        // Agent presence is an event, not screen state, so the snapshot can't
+        // carry it; replay it after the snapshot so it lands on top.
+        if (try self.agents.appendReplay(gpa, &client.write_buf)) {
+            client.has_pending_output = true;
+        }
+
         // only resize if leader
         if (is_leader) {
             // Supacode: snapshot before resizing. A surface can attach at a
@@ -1347,6 +1359,41 @@ pub const Daemon = struct {
         client.has_pending_output = true;
     }
 
+    /// Forwards an agent event to every attached terminal as OSC 3008 and
+    /// remembers presence for replay. Never fed to the terminal emulator: it
+    /// is not screen content and must not reach history or snapshots. Payloads
+    /// can carry prompt text, so they are not logged.
+    fn handleAgentNotify(self: *Daemon, gpa: std.mem.Allocator, io: std.Io, client: *Client, payload: []const u8) !void {
+        defer {
+            ipc.appendMessage(gpa, &client.write_buf, .Ack, "") catch {};
+            client.has_pending_output = true;
+        }
+        const parsed = agent.parse(gpa, payload) catch |err| {
+            std.log.warn("dropping agent notify: {s}", .{@errorName(err)});
+            return;
+        };
+        defer parsed.deinit();
+        const event = parsed.value;
+        if (event.kind == .presence) {
+            const now = std.Io.Timestamp.now(io, .real).toSeconds();
+            try self.agents.record(gpa, event.agent, event.event.?, event.pid, now);
+        }
+        const osc = try agent.render(gpa, event);
+        defer gpa.free(osc);
+        for (self.clients.items) |c| {
+            if (!c.is_terminal) continue;
+            try ipc.appendMessage(gpa, &c.write_buf, .Output, osc);
+            c.has_pending_output = true;
+        }
+    }
+
+    fn handleAgentStateGet(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !void {
+        const out = try self.agents.stateJson(gpa, self.session_name);
+        defer gpa.free(out);
+        try ipc.appendMessage(gpa, &client.write_buf, .AgentStateData, out);
+        client.has_pending_output = true;
+    }
+
     fn handleLabelGet(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !void {
         const out = try label.labelsToU8(gpa, self.labels);
         defer gpa.free(out);
@@ -1507,6 +1554,66 @@ test "handleInit snapshots a re-attach before resizing the terminal" {
 
     try std.testing.expectEqual(@as(u16, 46), term.cols);
     try std.testing.expect(std.mem.indexOf(u8, client.write_buf.items, expected) != null);
+}
+
+test "agent notify reaches attached terminals only, and presence replays on attach" {
+    const alloc = std.testing.allocator;
+    const cfg = Cfg{ .socket_dir = "", .log_dir = "" };
+    var term = try initTerminal(alloc, std.testing.io, .{ .cols = 80, .rows = 10 }, &cfg);
+    defer term.deinit(alloc);
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("prompt$ ");
+
+    var daemon = testDaemon();
+    defer daemon.clients.deinit(alloc);
+    defer daemon.pty_write_buf.deinit(alloc);
+    defer daemon.agents.deinit(alloc);
+    daemon.has_pty_output = true;
+
+    // Each client owns the read end of a pipe, closed by its deinit.
+    const attached_fds = try lib_posix.pipe2(.{});
+    defer lib_posix.close(attached_fds[1]);
+    const attached = try testClient(alloc, attached_fds[0], true);
+    defer {
+        attached.deinit(alloc);
+        alloc.destroy(attached);
+    }
+    const one_shot_fds = try lib_posix.pipe2(.{});
+    defer lib_posix.close(one_shot_fds[1]);
+    const one_shot = try testClient(alloc, one_shot_fds[0], false);
+    defer {
+        one_shot.deinit(alloc);
+        alloc.destroy(one_shot);
+    }
+    try daemon.clients.append(alloc, attached);
+    try daemon.clients.append(alloc, one_shot);
+
+    const busy = "\x1b]3008;start=claude;event=busy\x1b\\";
+    try daemon.handleAgentNotify(alloc, std.testing.io, one_shot, "{\"agent\":\"claude\",\"kind\":\"presence\",\"event\":\"busy\"}");
+    try std.testing.expect(std.mem.indexOf(u8, attached.write_buf.items, busy) != null);
+    // The reporter gets its Ack and nothing else.
+    try std.testing.expect(std.mem.indexOf(u8, one_shot.write_buf.items, busy) == null);
+
+    // A malformed event is acknowledged but neither forwarded nor stored.
+    attached.write_buf.clearRetainingCapacity();
+    try daemon.handleAgentNotify(alloc, std.testing.io, one_shot, "{\"agent\":\"claude\",\"kind\":\"presence\"}");
+    try std.testing.expectEqual(@as(usize, 0), attached.write_buf.items.len);
+    try std.testing.expectEqual(@as(usize, 1), daemon.agents.entries.items.len);
+
+    // A client attaching later gets the stored presence after its snapshot.
+    const fds = try lib_posix.pipe2(.{});
+    defer lib_posix.close(fds[1]);
+    const late = try testClient(alloc, fds[0], false);
+    defer {
+        late.deinit(alloc);
+        alloc.destroy(late);
+    }
+    const resize = ipc.Resize{ .rows = 10, .cols = 80 };
+    try daemon.handleInit(alloc, late, fds[1], &term, std.mem.asBytes(&resize));
+    const replay_at = std.mem.indexOf(u8, late.write_buf.items, busy) orelse return error.TestUnexpectedResult;
+    const snapshot_at = std.mem.indexOf(u8, late.write_buf.items, "prompt$") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(snapshot_at < replay_at);
 }
 
 test "send queues PTY input without changing leader" {

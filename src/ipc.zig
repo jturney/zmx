@@ -31,6 +31,15 @@ pub const Tag = enum(u8) {
     /// Scoped history: the active screen plus a bounded number of
     /// preceding scrollback rows. Request payload is `Capture`.
     Capture = 22,
+    // Agent bridge (Supacode fork). Kept clear of upstream's low range so its
+    // next tags never collide while the fork is carried.
+    /// A process in the session reports agent activity; payload is JSON
+    /// `agent.Notify`. Reply: `Ack`.
+    AgentNotify = 128,
+    /// Request the session's agent state. Reply: `AgentStateData`.
+    AgentStateGet = 134,
+    /// JSON snapshot of the session's agent state.
+    AgentStateData = 135,
     Unsupported = 255,
     // Non-exhaustive: this enum comes off the wire via bytesToValue and
     // @enumFromInt, so out-of-range values are representable
@@ -357,6 +366,12 @@ test "Tag wire values are frozen" {
         .{ Tag.LabelSet, 15 }, .{ Tag.LabelClear, 16 },   .{ Tag.LabelData, 17 },
         .{ Tag.Send, 18 },     .{ Tag.EnvGet, 19 },       .{ Tag.EnvSet, 20 },
         .{ Tag.EnvData, 21 },  .{ Tag.Capture, 22 },      .{ Tag.Unsupported, 255 },
+    }) |p| try std.testing.expectEqual(@as(u8, p[1]), @backingInt(p[0]));
+}
+
+test "agent Tag wire values are frozen" {
+    inline for (.{
+        .{ Tag.AgentNotify, 128 }, .{ Tag.AgentStateGet, 134 }, .{ Tag.AgentStateData, 135 },
     }) |p| try std.testing.expectEqual(@as(u8, p[1]), @backingInt(p[0]));
 }
 
