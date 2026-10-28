@@ -465,6 +465,9 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                 } else {
                     // Feed PTY output to terminal emulator for state tracking
                     vt_stream.nextSlice(buf[0..n]);
+                    daemon.passthrough.scan(gpa, buf[0..n]) catch |err| {
+                        std.log.warn("agent passthrough scan failed: {s}", .{@errorName(err)});
+                    };
                     daemon.setPwd(&term);
                     daemon.has_pty_output = true;
 
@@ -582,7 +585,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                         .Input => try daemon.handleInput(gpa, client, msg.payload),
                         .Send => daemon.handleSend(gpa, msg.payload),
                         .Output => try daemon.handleOutput(gpa, msg.payload, &term, &vt_stream),
-                        .Init => try daemon.handleInit(gpa, client, pty_fd, &term, msg.payload),
+                        .Init => try daemon.handleInit(gpa, io, client, pty_fd, &term, msg.payload),
                         .Switch => try daemon.handleSwitch(gpa, msg.payload),
                         .Resize => try daemon.handleResize(gpa, client, pty_fd, &term, msg.payload),
                         .Detach => {
@@ -723,6 +726,9 @@ pub const Daemon = struct {
     next_rid: u32 = 1,
     /// Connections streaming agent events (`zmx agent events`).
     subscribers: std.ArrayList(i32) = .empty,
+    /// Agent signals seen in PTY output (a nested session's, or an agent
+    /// writing OSC 3008 to its tty), replayed after this session's own.
+    passthrough: agent.Passthrough = .{},
     // This control which client is the leader.  The leader controls terminal state and
     // cols/rows of session.
     leader_client_fd: ?i32 = null,
@@ -774,6 +780,7 @@ pub const Daemon = struct {
         for (self.asks.items) |ask| ask.deinit(gpa);
         self.asks.deinit(gpa);
         self.subscribers.deinit(gpa);
+        self.passthrough.deinit(gpa);
         self.pty_write_buf.deinit(gpa);
         gpa.free(self.socket_path);
     }
@@ -1113,6 +1120,7 @@ pub const Daemon = struct {
     pub fn handleInit(
         self: *Daemon,
         gpa: std.mem.Allocator,
+        io: std.Io,
         client: *Client,
         pty_fd: i32,
         term: *ghostty_vt.Terminal,
@@ -1158,6 +1166,9 @@ pub const Daemon = struct {
         // Agent presence is an event, not screen state, so the snapshot can't
         // carry it; replay it after the snapshot so it lands on top.
         if (try self.agents.appendReplay(gpa, &client.write_buf)) {
+            client.has_pending_output = true;
+        }
+        if (try self.passthrough.appendReplay(gpa, &client.write_buf, std.Io.Timestamp.now(io, .real).toMilliseconds())) {
             client.has_pending_output = true;
         }
         for (self.asks.items) |*ask| {
@@ -1571,7 +1582,18 @@ pub const Daemon = struct {
         const now = std.Io.Timestamp.now(io, .real).toMilliseconds();
         const timeout: i64 = @intCast(std.math.clamp(req.timeout_ms, agent.min_ask_timeout_ms, agent.max_ask_timeout_ms));
 
-        const osc = try agent.renderAsk(gpa, req.agent, rid, &nonce_hex, self.session_name, req.type, req.title, req.summary, detail_json);
+        const osc = try agent.renderAsk(
+            gpa,
+            req.agent,
+            rid,
+            &nonce_hex,
+            self.session_name,
+            req.type,
+            now + timeout,
+            req.title,
+            req.summary,
+            detail_json,
+        );
         errdefer gpa.free(osc);
         const owned_agent = try gpa.dupe(u8, req.agent);
         errdefer gpa.free(owned_agent);
@@ -1675,7 +1697,7 @@ pub const Daemon = struct {
         if (outcome) |o| {
             if (self.clientByFd(ask.asker_fd)) |asker| sendDecision(gpa, asker, ask.rid, o) catch {};
         }
-        if (agent.renderResolved(gpa, ask.agent, ask.rid, why)) |osc| {
+        if (agent.renderResolved(gpa, ask.agent, ask.rid, self.session_name, why)) |osc| {
             defer gpa.free(osc);
             self.broadcastToTerminals(gpa, .Output, osc);
         } else |_| {}
@@ -1935,7 +1957,7 @@ test "handleInit snapshots a re-attach before resizing the terminal" {
 
     // A placeholder-sized attach must not reflow the snapshot it receives.
     const resize = ipc.Resize{ .rows = 10, .cols = 46 };
-    try daemon.handleInit(alloc, client, fds[1], &term, std.mem.asBytes(&resize));
+    try daemon.handleInit(alloc, std.testing.io, client, fds[1], &term, std.mem.asBytes(&resize));
 
     try std.testing.expectEqual(@as(u16, 46), term.cols);
     try std.testing.expect(std.mem.indexOf(u8, client.write_buf.items, expected) != null);
@@ -1995,7 +2017,7 @@ test "agent notify reaches attached terminals only, and presence replays on atta
         alloc.destroy(late);
     }
     const resize = ipc.Resize{ .rows = 10, .cols = 80 };
-    try daemon.handleInit(alloc, late, fds[1], &term, std.mem.asBytes(&resize));
+    try daemon.handleInit(alloc, std.testing.io, late, fds[1], &term, std.mem.asBytes(&resize));
     const replay_at = std.mem.indexOf(u8, late.write_buf.items, busy) orelse return error.TestUnexpectedResult;
     const snapshot_at = std.mem.indexOf(u8, late.write_buf.items, "prompt$") orelse return error.TestUnexpectedResult;
     try std.testing.expect(snapshot_at < replay_at);
@@ -2070,7 +2092,7 @@ test "agent ask: answered by the first valid reply, refused with a wrong nonce" 
         asker.lastFrame(.AgentDecision).?,
     );
     try std.testing.expectEqual(@as(usize, 0), daemon.asks.items.len);
-    try std.testing.expect(std.mem.indexOf(u8, viewer.client.write_buf.items, "kind=resolved;rid=1;why=answered") != null);
+    try std.testing.expect(std.mem.indexOf(u8, viewer.client.write_buf.items, "kind=resolved;rid=1;sess=") != null);
     try std.testing.expectEqualStrings("{\"rid\":1}", viewer.lastFrame(.AgentResolved).?);
 
     // A second reply finds nothing.
@@ -2123,7 +2145,7 @@ test "agent ask: timeout, asker disconnect, and the agent moving on end it" {
     viewer.client.write_buf.clearRetainingCapacity();
     _ = daemon.closeClient(alloc, leaving, daemon.clients.items.len - 1, false);
     try std.testing.expectEqual(@as(usize, 0), daemon.asks.items.len);
-    try std.testing.expect(std.mem.indexOf(u8, viewer.client.write_buf.items, "kind=resolved;rid=3;why=cancelled") != null);
+    try std.testing.expect(std.mem.indexOf(u8, viewer.client.write_buf.items, "kind=resolved;rid=3;sess=") != null);
 }
 
 test "agent ask: refused when invalid or when too many are pending" {

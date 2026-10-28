@@ -233,6 +233,7 @@ pub fn renderAsk(
     nonce_hex: []const u8,
     session: []const u8,
     ask_type: AskType,
+    deadline_ms: i64,
     title: []const u8,
     summary: []const u8,
     detail_json: []const u8,
@@ -245,8 +246,8 @@ pub fn renderAsk(
     defer gpa.free(encoded_title);
     const head = try std.fmt.allocPrint(
         gpa,
-        "kind=ask;rid={d};nonce={s};sess={s};type={t};title={s}",
-        .{ rid, nonce_hex, sess, ask_type, encoded_title },
+        "kind=ask;rid={d};nonce={s};sess={s};type={t};deadline={d};title={s}",
+        .{ rid, nonce_hex, sess, ask_type, deadline_ms, encoded_title },
     );
     defer gpa.free(head);
 
@@ -267,8 +268,230 @@ pub fn renderAsk(
     return std.fmt.allocPrint(gpa, "\x1b]3008;start={s};{s};sum={s}\x1b\\", .{ agent, head, sum });
 }
 
-pub fn renderResolved(gpa: std.mem.Allocator, agent: []const u8, rid: u32, why: ResolveReason) ![]u8 {
-    return std.fmt.allocPrint(gpa, "\x1b]3008;start={s};kind=resolved;rid={d};why={t}\x1b\\", .{ agent, rid, why });
+/// Names the session as well as the rid, since rids are only unique within
+/// one daemon and a nested chain carries several daemons' asks.
+pub fn renderResolved(gpa: std.mem.Allocator, agent: []const u8, rid: u32, session: []const u8, why: ResolveReason) ![]u8 {
+    const encoder = std.base64.standard.Encoder;
+    const sess = try gpa.alloc(u8, encoder.calcSize(session.len));
+    defer gpa.free(sess);
+    _ = encoder.encode(sess, session);
+    return std.fmt.allocPrint(
+        gpa,
+        "\x1b]3008;start={s};kind=resolved;rid={d};sess={s};why={t}\x1b\\",
+        .{ agent, rid, sess, why },
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Passthrough: agent signals that only pass through this session. When the
+// session's program is itself a terminal for another session (`ssh host zmx
+// attach`, or a nested `zmx attach`), the inner daemon's OSC 3008 reaches
+// this one as PTY output. Nothing would replay it after this session's own
+// clients reconnect, so remember the latest of each and replay it too. The
+// same goes for agents that write OSC 3008 straight to their tty.
+
+pub const osc_prefix = "\x1b]3008;";
+/// Longest sequence remembered; anything longer is passed through but not kept.
+pub const max_passthrough_len = 4096;
+pub const max_passthrough_entries = 32;
+
+pub const Passthrough = struct {
+    /// Remembered sequences, oldest first, each under a key that a newer
+    /// signal of the same kind replaces.
+    entries: std.ArrayList(Entry) = .empty,
+    /// A sequence (or prefix) cut off by the end of the previous read.
+    partial: std.ArrayList(u8) = .empty,
+    /// Whether `partial` overflowed; the rest of that sequence is skipped.
+    skipping: bool = false,
+    /// Whether the last byte held was ESC, which a `\\` at the start of the
+    /// next read would turn into the terminator.
+    tail_esc: bool = false,
+
+    pub const Entry = struct {
+        key: []u8,
+        osc: []u8,
+        /// An ask's deadline (unix ms); past it the ask is gone even if its
+        /// `resolved` never made it here (a dropped ssh link).
+        deadline_ms: ?i64 = null,
+    };
+
+    pub fn deinit(self: *Passthrough, gpa: std.mem.Allocator) void {
+        for (self.entries.items) |e| {
+            gpa.free(e.key);
+            gpa.free(e.osc);
+        }
+        self.entries.deinit(gpa);
+        self.partial.deinit(gpa);
+    }
+
+    /// Scans one chunk of PTY output. Cheap when it holds no OSC 3008: one
+    /// substring search, plus a few carried bytes at a boundary.
+    pub fn scan(self: *Passthrough, gpa: std.mem.Allocator, chunk: []const u8) !void {
+        var rest = chunk;
+
+        // A possible prefix (`ESC ] 30`...) carried from the last read.
+        if (!self.skipping and self.partial.items.len > 0 and self.partial.items.len < osc_prefix.len) {
+            const need = osc_prefix.len - self.partial.items.len;
+            const n = @min(need, rest.len);
+            if (!std.mem.eql(u8, rest[0..n], osc_prefix[self.partial.items.len..][0..n])) {
+                self.partial.clearRetainingCapacity(); // not a prefix after all
+            } else {
+                try self.partial.appendSlice(gpa, rest[0..n]);
+                rest = rest[n..];
+                if (n < need) return;
+            }
+        }
+
+        // A sequence cut off by the last read.
+        if (self.skipping or self.partial.items.len >= osc_prefix.len) {
+            // The terminator may straddle the boundary: ESC then `\`.
+            const end = if (self.tail_esc and rest.len > 0 and rest[0] == '\\') 1 else terminatorEnd(rest);
+            if (end) |e| {
+                if (!self.skipping and self.partial.items.len + e <= max_passthrough_len) {
+                    try self.partial.appendSlice(gpa, rest[0..e]);
+                    try self.remember(gpa, self.partial.items);
+                }
+                self.partial.clearRetainingCapacity();
+                self.skipping = false;
+                self.tail_esc = false;
+                rest = rest[e..];
+            } else {
+                try self.hold(gpa, rest);
+                return;
+            }
+        }
+
+        while (std.mem.indexOf(u8, rest, osc_prefix)) |at| {
+            const seq = rest[at..];
+            if (terminatorEnd(seq[osc_prefix.len..])) |e| {
+                const len = osc_prefix.len + e;
+                if (len <= max_passthrough_len) try self.remember(gpa, seq[0..len]);
+                rest = seq[len..];
+            } else {
+                try self.hold(gpa, seq);
+                return;
+            }
+        }
+
+        // Carry a trailing partial prefix into the next read.
+        var keep = @min(rest.len, osc_prefix.len - 1);
+        while (keep > 0) : (keep -= 1) {
+            if (std.mem.startsWith(u8, osc_prefix, rest[rest.len - keep ..])) {
+                try self.partial.appendSlice(gpa, rest[rest.len - keep ..]);
+                return;
+            }
+        }
+    }
+
+    /// Keeps an unterminated sequence for the next read, or gives up on it
+    /// once it is too long to be one worth remembering.
+    fn hold(self: *Passthrough, gpa: std.mem.Allocator, bytes: []const u8) !void {
+        if (bytes.len > 0) self.tail_esc = bytes[bytes.len - 1] == 0x1b;
+        if (self.skipping) return;
+        if (self.partial.items.len + bytes.len > max_passthrough_len) {
+            self.partial.clearRetainingCapacity();
+            self.skipping = true;
+            return;
+        }
+        try self.partial.appendSlice(gpa, bytes);
+    }
+
+    /// Queues every remembered sequence as `.Output`, oldest first, first
+    /// dropping asks whose deadline has passed.
+    pub fn appendReplay(self: *Passthrough, gpa: std.mem.Allocator, buf: *std.ArrayList(u8), now_ms: i64) !bool {
+        var i: usize = 0;
+        while (i < self.entries.items.len) {
+            const e = self.entries.items[i];
+            if (e.deadline_ms != null and e.deadline_ms.? <= now_ms) {
+                gpa.free(e.key);
+                gpa.free(e.osc);
+                _ = self.entries.orderedRemove(i);
+                continue;
+            }
+            i += 1;
+        }
+        for (self.entries.items) |e| try ipc.appendMessage(gpa, buf, .Output, e.osc);
+        return self.entries.items.len > 0;
+    }
+
+    fn remember(self: *Passthrough, gpa: std.mem.Allocator, osc: []const u8) !void {
+        const body = osc[osc_prefix.len .. osc.len - (if (osc[osc.len - 1] == 0x07) @as(usize, 1) else 2)];
+        const semi = std.mem.indexOfScalar(u8, body, ';') orelse return;
+        const id = body[0..semi];
+        const metadata = body[semi + 1 ..];
+        const agent_name = if (std.mem.indexOfScalar(u8, id, '=')) |eq| id[eq + 1 ..] else return;
+        const kind = field(metadata, "kind");
+
+        var key_buf: [256]u8 = undefined;
+        if (kind) |k| {
+            if (std.mem.eql(u8, k, "ask")) {
+                const key = keyFor(&key_buf, "ask", field(metadata, "sess"), field(metadata, "rid")) orelse return;
+                const deadline = if (field(metadata, "deadline")) |d| std.fmt.parseInt(i64, d, 10) catch null else null;
+                return self.put(gpa, key, osc, deadline);
+            }
+            if (std.mem.eql(u8, k, "resolved")) {
+                const key = keyFor(&key_buf, "ask", field(metadata, "sess"), field(metadata, "rid")) orelse return;
+                self.remove(gpa, key);
+                return;
+            }
+            if (std.mem.eql(u8, k, "progress")) {
+                const key = keyFor(&key_buf, "progress", agent_name, "") orelse return;
+                return self.put(gpa, key, osc, null);
+            }
+            return; // notify and unknown kinds are one-off events
+        }
+        if (field(metadata, "event") == null) return;
+        const key = keyFor(&key_buf, "presence", agent_name, "") orelse return;
+        return self.put(gpa, key, osc, null);
+    }
+
+    fn put(self: *Passthrough, gpa: std.mem.Allocator, key: []const u8, osc: []const u8, deadline_ms: ?i64) !void {
+        self.remove(gpa, key);
+        if (self.entries.items.len >= max_passthrough_entries) {
+            const oldest = self.entries.orderedRemove(0);
+            gpa.free(oldest.key);
+            gpa.free(oldest.osc);
+        }
+        const owned_key = try gpa.dupe(u8, key);
+        errdefer gpa.free(owned_key);
+        const owned_osc = try gpa.dupe(u8, osc);
+        errdefer gpa.free(owned_osc);
+        try self.entries.append(gpa, .{ .key = owned_key, .osc = owned_osc, .deadline_ms = deadline_ms });
+    }
+
+    fn remove(self: *Passthrough, gpa: std.mem.Allocator, key: []const u8) void {
+        for (self.entries.items, 0..) |e, i| {
+            if (std.mem.eql(u8, e.key, key)) {
+                gpa.free(e.key);
+                gpa.free(e.osc);
+                _ = self.entries.orderedRemove(i);
+                return;
+            }
+        }
+    }
+};
+
+/// Index just past an OSC terminator (ST or BEL) in `bytes`, if any.
+fn terminatorEnd(bytes: []const u8) ?usize {
+    for (bytes, 0..) |b, i| {
+        if (b == 0x07) return i + 1;
+        if (b == '\\' and i > 0 and bytes[i - 1] == 0x1b) return i + 1;
+    }
+    return null;
+}
+
+/// The value of `key` in `k=v;k=v` metadata.
+fn field(metadata: []const u8, key: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, metadata, ';');
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        if (std.mem.eql(u8, pair[0..eq], key)) return pair[eq + 1 ..];
+    }
+    return null;
+}
+
+fn keyFor(buf: []u8, kind: []const u8, a: ?[]const u8, b: ?[]const u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, "{s}:{s}:{s}", .{ kind, a orelse return null, b orelse return null }) catch null;
 }
 
 /// The latest presence per agent, oldest first, for replay and `zmx agent status`.
@@ -473,10 +696,10 @@ test "store drops the least recently updated agent past its cap" {
 test "ask renders its fields, shedding the detail first when too long" {
     const alloc = std.testing.allocator;
     const nonce = "0123456789abcdef0123456789abcdef";
-    const small = try renderAsk(alloc, "claude", 7, nonce, "dev", .permission, "Bash", "rm -rf build", "{\"command\":\"rm -rf build\"}");
+    const small = try renderAsk(alloc, "claude", 7, nonce, "dev", .permission, 1700000000000, "Bash", "rm -rf build", "{\"command\":\"rm -rf build\"}");
     defer alloc.free(small);
     try std.testing.expectEqualStrings(
-        "\x1b]3008;start=claude;kind=ask;rid=7;nonce=" ++ nonce ++ ";sess=ZGV2;type=permission;title=QmFzaA==;" ++
+        "\x1b]3008;start=claude;kind=ask;rid=7;nonce=" ++ nonce ++ ";sess=ZGV2;type=permission;deadline=1700000000000;title=QmFzaA==;" ++
             "sum=cm0gLXJmIGJ1aWxk;det=eyJjb21tYW5kIjoicm0gLXJmIGJ1aWxkIn0=\x1b\\",
         small,
     );
@@ -485,7 +708,7 @@ test "ask renders its fields, shedding the detail first when too long" {
     var long_detail: [2002]u8 = @splat('y');
     long_detail[0] = '"';
     long_detail[long_detail.len - 1] = '"';
-    const big = try renderAsk(alloc, "claude", 8, nonce, "dev", .question, "Pick", &long_summary, &long_detail);
+    const big = try renderAsk(alloc, "claude", 8, nonce, "dev", .question, 1700000000000, "Pick", &long_summary, &long_detail);
     defer alloc.free(big);
     try std.testing.expect(std.mem.indexOf(u8, big, ";det=") == null);
     const metadata_len = big.len - "\x1b]3008;start=claude;".len - "\x1b\\".len;
@@ -494,9 +717,9 @@ test "ask renders its fields, shedding the detail first when too long" {
 
 test "resolved names the ask and why it ended" {
     const alloc = std.testing.allocator;
-    const osc = try renderResolved(alloc, "claude", 7, .timeout);
+    const osc = try renderResolved(alloc, "claude", 7, "dev", .timeout);
     defer alloc.free(osc);
-    try std.testing.expectEqualStrings("\x1b]3008;start=claude;kind=resolved;rid=7;why=timeout\x1b\\", osc);
+    try std.testing.expectEqualStrings("\x1b]3008;start=claude;kind=resolved;rid=7;sess=ZGV2;why=timeout\x1b\\", osc);
 }
 
 test "nonce comparison" {
@@ -506,4 +729,90 @@ test "nonce comparison" {
     try std.testing.expect(!ask.nonceMatches("0123456789abcdef0123456789abcdee"));
     try std.testing.expect(!ask.nonceMatches("short"));
     try std.testing.expect(!ask.nonceMatches("zz23456789abcdef0123456789abcdef"));
+}
+
+test "passthrough remembers the latest presence and open asks, across split reads" {
+    const alloc = std.testing.allocator;
+    var cache: Passthrough = .{};
+    defer cache.deinit(alloc);
+
+    const busy = "\x1b]3008;start=claude;event=busy\x1b\\";
+    const idle = "\x1b]3008;start=claude;event=idle\x07";
+    const ask = "\x1b]3008;start=claude;kind=ask;rid=3;nonce=00;sess=Qg==;type=permission;title=eA==\x1b\\";
+    const resolved = "\x1b]3008;start=claude;kind=resolved;rid=3;sess=Qg==;why=answered\x1b\\";
+    const notify = "\x1b]3008;start=claude;kind=notify;title=eA==;body=eA==\x1b\\";
+
+    const stream = "ls\r\n" ++ busy ++ "out" ++ ask ++ notify ++ "more" ++ idle ++ "$ ";
+    // Every split point of the whole stream gives the same cache.
+    for (0..stream.len + 1) |split| {
+        var c: Passthrough = .{};
+        defer c.deinit(alloc);
+        try c.scan(alloc, stream[0..split]);
+        try c.scan(alloc, stream[split..]);
+        try std.testing.expectEqual(@as(usize, 2), c.entries.items.len);
+        try std.testing.expectEqualStrings(ask, c.entries.items[0].osc);
+        try std.testing.expectEqualStrings(idle, c.entries.items[1].osc);
+    }
+
+    try cache.scan(alloc, stream);
+    try cache.scan(alloc, resolved);
+    try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
+    try std.testing.expectEqualStrings(idle, cache.entries.items[0].osc);
+
+    // The same rid from another session is a different ask.
+    try cache.scan(alloc, ask);
+    try cache.scan(alloc, "\x1b]3008;start=claude;kind=resolved;rid=3;sess=QQ==;why=answered\x1b\\");
+    try std.testing.expectEqual(@as(usize, 2), cache.entries.items.len);
+}
+
+test "passthrough ignores other OSCs and gives up on oversized ones" {
+    const alloc = std.testing.allocator;
+    var cache: Passthrough = .{};
+    defer cache.deinit(alloc);
+    try cache.scan(alloc, "\x1b]0;title\x07\x1b]300;x\x07\x1b]30");
+    try cache.scan(alloc, "08;start=claude;event=busy\x1b\\");
+    try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
+
+    // A carried ESC that turns out to be an arrow key doesn't swallow what follows.
+    var fresh: Passthrough = .{};
+    defer fresh.deinit(alloc);
+    try fresh.scan(alloc, "\x1b");
+    try fresh.scan(alloc, "[Aabc\x1b]3008;start=claude;event=busy\x1b\\");
+    try std.testing.expectEqual(@as(usize, 1), fresh.entries.items.len);
+
+    var big: [max_passthrough_len + 100]u8 = @splat('x');
+    @memcpy(big[0..osc_prefix.len], osc_prefix);
+    try cache.scan(alloc, &big);
+    try cache.scan(alloc, "\x1b\\\x1b]3008;start=codex;event=idle\x1b\\");
+    try std.testing.expectEqual(@as(usize, 2), cache.entries.items.len);
+    try std.testing.expectEqualStrings("presence:codex:", cache.entries.items[1].key);
+}
+
+test "passthrough keeps at most its cap, dropping the oldest" {
+    const alloc = std.testing.allocator;
+    var cache: Passthrough = .{};
+    defer cache.deinit(alloc);
+    var buf: [128]u8 = undefined;
+    for (0..max_passthrough_entries + 3) |i| {
+        const seq = try std.fmt.bufPrint(&buf, "\x1b]3008;start=a{d};event=busy\x1b\\", .{i});
+        try cache.scan(alloc, seq);
+    }
+    try std.testing.expectEqual(@as(usize, max_passthrough_entries), cache.entries.items.len);
+    try std.testing.expectEqualStrings("presence:a3:", cache.entries.items[0].key);
+}
+
+test "passthrough drops an ask past its deadline at replay" {
+    const alloc = std.testing.allocator;
+    var cache: Passthrough = .{};
+    defer cache.deinit(alloc);
+    try cache.scan(alloc, "\x1b]3008;start=claude;kind=ask;rid=1;nonce=00;sess=Qg==;type=permission;deadline=5000;title=eA==\x1b\\");
+    try cache.scan(alloc, "\x1b]3008;start=claude;event=busy\x1b\\");
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+    try std.testing.expect(try cache.appendReplay(alloc, &buf, 4999));
+    try std.testing.expectEqual(@as(usize, 2), cache.entries.items.len);
+    buf.clearRetainingCapacity();
+    try std.testing.expect(try cache.appendReplay(alloc, &buf, 5000));
+    try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "kind=ask") == null);
 }

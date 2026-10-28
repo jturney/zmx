@@ -300,3 +300,84 @@ PY
   run "$ZMX" history test-ask-tty
   [[ "$output" != *"zmx-reply"* ]]
 }
+
+# ============================================================================
+# Nested sessions: session nest-a's program is `zmx attach nest-b`, the shape
+# of a Supacode remote surface (`ssh host zmx attach`).
+# ============================================================================
+
+# nest <outer> <inner>: starts <inner> running `cat`, and <outer> attached to it.
+nest() {
+  local outer="$1" inner="$2"
+  "$ZMX" run "$inner" -d bash -c 'echo READY; exec cat'
+  wait_for_output "$inner" "READY"
+  "$ZMX" run "$outer" -d env -u ZMX_SESSION ZMX_DIR="$ZMX_DIR" "$ZMX" attach "$inner"
+  wait_for_session "$outer"
+  # The inner session has a terminal client once the outer's attach is up.
+  local i=0
+  while (( i < 50 )); do
+    "$ZMX" list 2>/dev/null | grep -F "name=$inner" | grep -q "clients=1" && return 0
+    sleep 0.1
+    (( i++ )) || true
+  done
+  echo "Timed out waiting for '$outer' to attach to '$inner'" >&2
+  return 1
+}
+
+@test "nested: the inner session's presence replays from the outer one" {
+  nest nest-a nest-b
+
+  "$ZMX" agent notify --session nest-b --event awaiting_input --agent codex
+  sleep 0.3
+
+  run attach_capture nest-a
+  [[ "$output" == *"<ESC>]3008;start=codex;event=awaiting_input<ESC>\\"* ]]
+}
+
+@test "nested: a reply typed into the outer session answers the inner ask" {
+  nest nest-c nest-d
+
+  start_ask nest-d
+  wait_for_pending nest-d > /dev/null
+  sleep 0.3
+
+  python3 - "$ZMX" nest-c 3>&- <<'PY'
+import base64, json, os, pty, re, select, sys, time
+zmx, session = sys.argv[1], sys.argv[2]
+pid, fd = pty.fork()
+if pid == 0:
+    os.execv(zmx, [zmx, "attach", session])
+out, deadline, m = b"", time.time() + 10, None
+while time.time() < deadline and not m:
+    if select.select([fd], [], [], 0.1)[0]:
+        out += os.read(fd, 65536)
+    m = re.search(rb"kind=ask;rid=(\d+);nonce=([0-9a-f]{32});sess=([A-Za-z0-9+/=]+);", out)
+if not m:
+    sys.exit("the outer terminal never saw the inner ask")
+if base64.b64decode(m[3]) != b"nest-d":
+    sys.exit("the ask names the wrong session: %r" % base64.b64decode(m[3]))
+decision = base64.b64encode(json.dumps({"behavior": "allow"}).encode()).decode()
+reply = "\x1b_zmx-reply;sess=%s;rid=%s;nonce=%s;d=%s\x1b\\" % (m[3].decode(), m[1].decode(), m[2].decode(), decision)
+os.write(fd, reply.encode())
+time.sleep(1)
+os.write(fd, b"\x1c")
+time.sleep(0.3)
+os.kill(pid, 9)
+PY
+
+  wait "$ASK_PID"
+  [ "$(cat "$BATS_TEST_TMPDIR/ask.out")" = '{"behavior":"allow"}' ]
+  run "$ZMX" history nest-d
+  [[ "$output" != *"zmx-reply"* ]]
+}
+
+@test "nested: a resolved ask stops replaying from the outer session" {
+  nest nest-e nest-f
+
+  start_ask nest-f --timeout 1
+  wait "$ASK_PID"
+  sleep 0.3
+
+  run attach_capture nest-e
+  [[ "$output" != *"kind=ask"* ]]
+}
