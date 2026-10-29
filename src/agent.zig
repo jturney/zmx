@@ -8,8 +8,10 @@
 //! notifications:
 //!   presence: ESC ] 3008 ; <start|end>=<agent> ; event=<event>[;pid=<pid>] ESC \
 //!   notify:   ESC ] 3008 ; start=<agent> ; kind=notify;title=<b64>;body=<b64> ESC \
-//! Notify text is the JSON-escaped string (no surrounding quotes), capped in
-//! bytes and then standard base64, which is what Supacode decodes.
+//!   progress: ESC ] 3008 ; start=<agent> ; kind=progress;done=<n>;total=<n>[;cur=<b64>] ESC \
+//! Notify text (and a progress's current step) is the JSON-escaped string (no
+//! surrounding quotes), capped in bytes and then standard base64, which is
+//! what Supacode decodes. A progress with `total=0` clears the agent's.
 const std = @import("std");
 const ipc = @import("ipc.zig");
 
@@ -19,6 +21,8 @@ pub const max_agent_name_len = 32;
 /// `notifyTitleByteBudget` and `notifyBodyByteBudget`.
 pub const notify_title_budget = 160;
 pub const notify_body_budget = 1000;
+/// Byte budget for a progress's escaped current step.
+pub const progress_current_budget = 160;
 /// Agents remembered per session; the least recently updated one is dropped.
 pub const max_agents = 8;
 
@@ -32,7 +36,7 @@ pub const Event = enum {
     compacting,
 };
 
-pub const Kind = enum { presence, notify };
+pub const Kind = enum { presence, notify, progress };
 
 /// `AgentNotify` payload.
 pub const Notify = struct {
@@ -43,6 +47,10 @@ pub const Notify = struct {
     pid: ?i32 = null,
     title: ?[]const u8 = null,
     body: ?[]const u8 = null,
+    /// Progress: steps finished out of `total`, and the step under way.
+    done: ?u32 = null,
+    total: ?u32 = null,
+    current: ?[]const u8 = null,
 };
 
 pub const ValidationError = error{
@@ -52,6 +60,7 @@ pub const ValidationError = error{
     InvalidPid,
     EmptyNotify,
     InvalidUtf8,
+    InvalidProgress,
 };
 
 pub fn validate(n: Notify) ValidationError!void {
@@ -70,6 +79,12 @@ pub fn validate(n: Notify) ValidationError!void {
             if (!std.unicode.utf8ValidateSlice(title) or !std.unicode.utf8ValidateSlice(body)) {
                 return error.InvalidUtf8;
             }
+        },
+        .progress => {
+            const done = n.done orelse return error.InvalidProgress;
+            const total = n.total orelse return error.InvalidProgress;
+            if (done > total) return error.InvalidProgress;
+            if (n.current) |current| if (!std.unicode.utf8ValidateSlice(current)) return error.InvalidUtf8;
         },
     }
 }
@@ -97,6 +112,7 @@ pub fn render(gpa: std.mem.Allocator, n: Notify) ![]u8 {
     return switch (n.kind) {
         .presence => renderPresence(gpa, n.agent, n.event.?, n.pid),
         .notify => renderNotify(gpa, n.agent, n.title orelse "", n.body orelse ""),
+        .progress => renderProgress(gpa, n.agent, n.done.?, n.total.?, n.current orelse ""),
     };
 }
 
@@ -117,6 +133,19 @@ pub fn renderNotify(gpa: std.mem.Allocator, agent: []const u8, title: []const u8
         gpa,
         "\x1b]3008;start={s};kind=notify;title={s};body={s}\x1b\\",
         .{ agent, encoded_title, encoded_body },
+    );
+}
+
+pub fn renderProgress(gpa: std.mem.Allocator, agent: []const u8, done: u32, total: u32, current: []const u8) ![]u8 {
+    if (current.len == 0) {
+        return std.fmt.allocPrint(gpa, "\x1b]3008;start={s};kind=progress;done={d};total={d}\x1b\\", .{ agent, done, total });
+    }
+    const encoded = try encodeNotifyText(gpa, current, progress_current_budget);
+    defer gpa.free(encoded);
+    return std.fmt.allocPrint(
+        gpa,
+        "\x1b]3008;start={s};kind=progress;done={d};total={d};cur={s}\x1b\\",
+        .{ agent, done, total, encoded },
     );
 }
 
@@ -507,9 +536,21 @@ fn keyFor(buf: []u8, kind: []const u8, a: ?[]const u8, b: ?[]const u8) ?[]const 
     return std.fmt.bufPrint(buf, "{s}:{s}:{s}", .{ kind, a orelse return null, b orelse return null }) catch null;
 }
 
-/// The latest presence per agent, oldest first, for replay and `zmx agent status`.
+/// The latest presence per agent, oldest first, for replay and `zmx agent status`,
+/// and the latest progress per agent, replayed after them.
 pub const Store = struct {
     entries: std.ArrayList(Entry) = .empty,
+    progress: std.ArrayList(Progress) = .empty,
+
+    pub const Progress = struct {
+        agent: []u8,
+        osc: []u8,
+
+        fn deinit(self: Progress, gpa: std.mem.Allocator) void {
+            gpa.free(self.agent);
+            gpa.free(self.osc);
+        }
+    };
 
     pub const Entry = struct {
         agent: []u8,
@@ -529,6 +570,33 @@ pub const Store = struct {
     pub fn deinit(self: *Store, gpa: std.mem.Allocator) void {
         for (self.entries.items) |entry| entry.deinit(gpa);
         self.entries.deinit(gpa);
+        for (self.progress.items) |entry| entry.deinit(gpa);
+        self.progress.deinit(gpa);
+    }
+
+    /// Keeps `osc` as the agent's progress, or forgets it when `total` is 0.
+    pub fn recordProgress(self: *Store, gpa: std.mem.Allocator, agent: []const u8, total: u32, osc: []const u8) !void {
+        self.forgetProgress(gpa, agent);
+        if (total == 0) return;
+        if (self.progress.items.len >= max_agents) {
+            self.progress.items[0].deinit(gpa);
+            _ = self.progress.orderedRemove(0);
+        }
+        const owned_agent = try gpa.dupe(u8, agent);
+        errdefer gpa.free(owned_agent);
+        const owned_osc = try gpa.dupe(u8, osc);
+        errdefer gpa.free(owned_osc);
+        try self.progress.append(gpa, .{ .agent = owned_agent, .osc = owned_osc });
+    }
+
+    pub fn forgetProgress(self: *Store, gpa: std.mem.Allocator, agent: []const u8) void {
+        for (self.progress.items, 0..) |entry, i| {
+            if (std.mem.eql(u8, entry.agent, agent)) {
+                entry.deinit(gpa);
+                _ = self.progress.orderedRemove(i);
+                return;
+            }
+        }
     }
 
     /// Records a presence event, replacing the agent's previous one and moving
@@ -556,7 +624,8 @@ pub const Store = struct {
     /// most recent agent's state is the one a client applies last.
     pub fn appendReplay(self: *const Store, gpa: std.mem.Allocator, buf: *std.ArrayList(u8)) !bool {
         for (self.entries.items) |entry| try ipc.appendMessage(gpa, buf, .Output, entry.osc);
-        return self.entries.items.len > 0;
+        for (self.progress.items) |entry| try ipc.appendMessage(gpa, buf, .Output, entry.osc);
+        return self.entries.items.len + self.progress.items.len > 0;
     }
 
     /// `AgentStateData` payload. Nonces are left out: anything that can ask
@@ -615,6 +684,33 @@ test "presence renders exactly what Supacode's hooks emit" {
     const failed = try renderPresence(alloc, "claude", .@"error", null);
     defer alloc.free(failed);
     try std.testing.expectEqualStrings("\x1b]3008;start=claude;event=error\x1b\\", failed);
+}
+
+test "progress renders its counts and the current step" {
+    const alloc = std.testing.allocator;
+    const osc = try renderProgress(alloc, "claude", 1, 3, "Run tests");
+    defer alloc.free(osc);
+    // base64("Run tests").
+    try std.testing.expectEqualStrings("\x1b]3008;start=claude;kind=progress;done=1;total=3;cur=UnVuIHRlc3Rz\x1b\\", osc);
+
+    const bare = try renderProgress(alloc, "claude", 0, 0, "");
+    defer alloc.free(bare);
+    try std.testing.expectEqualStrings("\x1b]3008;start=claude;kind=progress;done=0;total=0\x1b\\", bare);
+
+    try std.testing.expectError(error.InvalidProgress, validate(.{ .agent = "claude", .kind = .progress, .done = 4, .total = 3 }));
+    try std.testing.expectError(error.InvalidProgress, validate(.{ .agent = "claude", .kind = .progress, .done = 1 }));
+}
+
+test "the store keeps one progress per agent and forgets a cleared one" {
+    const alloc = std.testing.allocator;
+    var store: Store = .{};
+    defer store.deinit(alloc);
+    try store.recordProgress(alloc, "claude", 3, "a");
+    try store.recordProgress(alloc, "claude", 3, "b");
+    try std.testing.expectEqual(@as(usize, 1), store.progress.items.len);
+    try std.testing.expectEqualStrings("b", store.progress.items[0].osc);
+    try store.recordProgress(alloc, "claude", 0, "c");
+    try std.testing.expectEqual(@as(usize, 0), store.progress.items.len);
 }
 
 test "notify text is JSON-escaped, then base64" {

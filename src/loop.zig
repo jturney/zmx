@@ -1167,8 +1167,8 @@ pub const Daemon = struct {
             }
         }
 
-        // Agent presence is an event, not screen state, so the snapshot can't
-        // carry it; replay it after the snapshot so it lands on top.
+        // Agent presence and progress are events, not screen state, so the
+        // snapshot can't carry them; replay them after it so they land on top.
         if (try self.agents.appendReplay(gpa, &client.write_buf)) {
             client.has_pending_output = true;
         }
@@ -1540,9 +1540,12 @@ pub const Daemon = struct {
                 .idle, .@"error", .session_end => self.cancelAgentAsks(gpa, event.agent),
                 else => {},
             }
+            // A new session starts with no task list.
+            if (event.event.? == .session_end) self.agents.forgetProgress(gpa, event.agent);
         }
         const osc = try agent.render(gpa, event);
         defer gpa.free(osc);
+        if (event.kind == .progress) try self.agents.recordProgress(gpa, event.agent, event.total.?, osc);
         self.broadcastToTerminals(gpa, .Output, osc);
         const json = switch (event.kind) {
             .presence => try std.json.Stringify.valueAlloc(
@@ -1553,6 +1556,11 @@ pub const Daemon = struct {
             .notify => try std.json.Stringify.valueAlloc(
                 gpa,
                 .{ .type = "notify", .agent = event.agent, .title = event.title orelse "", .body = event.body orelse "" },
+                .{},
+            ),
+            .progress => try std.json.Stringify.valueAlloc(
+                gpa,
+                .{ .type = "progress", .agent = event.agent, .done = event.done.?, .total = event.total.?, .current = event.current orelse "" },
                 .{},
             ),
         };

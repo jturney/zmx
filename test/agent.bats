@@ -455,3 +455,58 @@ start_hook() {
   [ "$status" -eq 0 ]
   [ -z "$output" ]
 }
+
+@test "progress replays to a client that attaches later, and total 0 clears it" {
+  "$ZMX" run test-prog -d sleep 30
+  wait_for_session test-prog
+
+  "$ZMX" agent notify --session test-prog --kind progress --done 1 --total 3 --current "Run tests"
+  run attach_capture test-prog
+  # base64("Run tests").
+  [[ "$output" == *"<ESC>]3008;start=claude;kind=progress;done=1;total=3;cur=UnVuIHRlc3Rz<ESC>\\"* ]]
+
+  "$ZMX" agent notify --session test-prog --kind progress --done 0 --total 0
+  run attach_capture test-prog
+  [[ "$output" != *"kind=progress"* ]]
+}
+
+@test "progress over its total is refused without failing" {
+  "$ZMX" run test-prog-bad -d sleep 30
+  wait_for_session test-prog-bad
+  run "$ZMX" agent notify --session test-prog-bad --kind progress --done 4 --total 3
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"InvalidProgress"* ]]
+}
+
+@test "hook: progress reads the session's task files" {
+  "$ZMX" run test-hook-progress -d sleep 30
+  wait_for_session test-hook-progress
+  local tasks="$BATS_TEST_TMPDIR/claude/tasks/sess-1"
+  mkdir -p "$tasks"
+  echo '{"id":"1","subject":"Build","status":"completed"}' > "$tasks/1.json"
+  echo '{"id":"2","subject":"Test","activeForm":"Testing","status":"in_progress"}' > "$tasks/2.json"
+  echo '{"id":"3","subject":"Ship","status":"pending"}' > "$tasks/3.json"
+
+  run bash -c 'echo "{\"session_id\":\"sess-1\",\"hook_event_name\":\"PostToolUse\",\"tool_name\":\"TaskUpdate\"}" | CLAUDE_CONFIG_DIR="$1/claude" "$0" agent hook claude progress --session test-hook-progress' "$ZMX" "$BATS_TEST_TMPDIR"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  run attach_capture test-hook-progress
+  # base64("Testing").
+  [[ "$output" == *"kind=progress;done=1;total=3;cur=VGVzdGluZw==<ESC>"* ]]
+}
+
+@test "hook: progress from TodoWrite, and a new session clears it" {
+  "$ZMX" run test-hook-todo -d sleep 30
+  wait_for_session test-hook-todo
+
+  echo '{"session_id":"s","tool_name":"TodoWrite","tool_input":{"todos":[{"content":"A","status":"completed","activeForm":"Doing A"},{"content":"B","status":"pending","activeForm":"Doing B"}]}}' \
+    | CLAUDE_CONFIG_DIR="$BATS_TEST_TMPDIR/none" "$ZMX" agent hook claude progress --session test-hook-todo
+  run attach_capture test-hook-todo
+  [[ "$output" == *"kind=progress;done=1;total=2<ESC>"* ]]
+
+  # SessionStart for a session with no task files reports an empty list.
+  echo '{"session_id":"fresh","hook_event_name":"SessionStart"}' \
+    | CLAUDE_CONFIG_DIR="$BATS_TEST_TMPDIR/none" "$ZMX" agent hook claude progress --session test-hook-todo
+  run attach_capture test-hook-todo
+  [[ "$output" != *"kind=progress"* ]]
+}

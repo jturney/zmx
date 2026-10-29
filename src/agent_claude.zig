@@ -8,11 +8,14 @@
 //!   question: a `PreToolUse` hook on `AskUserQuestion`. Output:
 //!     {"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow",
 //!      "updatedInput":{...tool_input, "answers":{...}}}}
+//!   progress: a `PostToolUse` hook on the task list tools (`TaskCreate`,
+//!     `TaskUpdate`, `TodoWrite`) or `SessionStart`. Reports how far through
+//!     its task list the agent is; never prints anything.
 //! No output means "not answered", and Claude prompts in the terminal.
 const std = @import("std");
 const agent = @import("agent.zig");
 
-pub const Hook = enum { permission, question };
+pub const Hook = enum { permission, question, progress };
 
 /// Longest string kept in an ask's detail; tool inputs can carry whole files.
 pub const detail_string_cap = 1000;
@@ -33,6 +36,7 @@ pub fn askFor(arena: std.mem.Allocator, hook: Hook, input: std.json.Value) !?Ask
     const tool = stringField(input, "tool_name") orelse return null;
     const tool_input = input.object.get("tool_input") orelse std.json.Value{ .object = .empty };
     switch (hook) {
+        .progress => return null,
         .permission => return .{
             .type = .permission,
             .title = tool,
@@ -57,6 +61,7 @@ pub fn askFor(arena: std.mem.Allocator, hook: Hook, input: std.json.Value) !?Ask
 pub fn output(gpa: std.mem.Allocator, hook: Hook, input: std.json.Value, decision: std.json.Value) !?[]u8 {
     if (decision != .object) return null;
     switch (hook) {
+        .progress => return null,
         .permission => {
             const behavior = stringField(decision, "behavior") orelse return null;
             var out: std.json.ObjectMap = .empty;
@@ -94,6 +99,63 @@ pub fn output(gpa: std.mem.Allocator, hook: Hook, input: std.json.Value, decisio
             } }, .{});
         },
     }
+}
+
+/// How far through its task list an agent is.
+pub const Progress = struct {
+    done: u32,
+    total: u32,
+    /// The step under way, or empty.
+    current: []const u8,
+};
+
+/// Progress from a `TodoWrite` call, which carries the whole list, or null for
+/// any other hook input (the task tools keep their list in files instead).
+pub fn todoProgress(input: std.json.Value) ?Progress {
+    if (!std.mem.eql(u8, stringField(input, "tool_name") orelse return null, "TodoWrite")) return null;
+    const tool_input = input.object.get("tool_input") orelse return null;
+    if (tool_input != .object) return null;
+    const todos = tool_input.object.get("todos") orelse return null;
+    if (todos != .array) return null;
+    return progressOf(todos.array.items, "content");
+}
+
+/// Progress from the task files of Claude's task list, one JSON object each.
+pub fn taskProgress(tasks: []const std.json.Value) Progress {
+    return progressOf(tasks, "subject");
+}
+
+/// Counts finished items, and takes the first one under way (by `id` when
+/// items carry one) as the current step, preferring its `activeForm`.
+fn progressOf(items: []const std.json.Value, title_key: []const u8) Progress {
+    var progress: Progress = .{ .done = 0, .total = 0, .current = "" };
+    var current_id: ?u64 = null;
+    for (items) |item| {
+        const status = stringField(item, "status") orelse continue;
+        if (std.mem.eql(u8, status, "deleted")) continue;
+        progress.total += 1;
+        if (std.mem.eql(u8, status, "completed")) progress.done += 1;
+        if (!std.mem.eql(u8, status, "in_progress")) continue;
+        const id = if (stringField(item, "id")) |id| std.fmt.parseInt(u64, id, 10) catch null else null;
+        const earlier = progress.current.len == 0 or (id != null and current_id != null and id.? < current_id.?);
+        if (!earlier) continue;
+        current_id = id;
+        progress.current = stringField(item, "activeForm") orelse stringField(item, title_key) orelse "";
+    }
+    return progress;
+}
+
+/// Where Claude keeps a session's task list: `<config dir>/tasks/<list id>`,
+/// the list id being `CLAUDE_CODE_TASK_LIST_ID` when set, else the session id.
+/// Null when the id could leave that folder. Caller owns the path.
+pub fn taskListDir(gpa: std.mem.Allocator, config_dir: []const u8, list_id: []const u8) !?[]u8 {
+    if (list_id.len == 0 or list_id.len > 128) return null;
+    if (std.mem.eql(u8, list_id, ".") or std.mem.eql(u8, list_id, "..")) return null;
+    for (list_id) |c| switch (c) {
+        'a'...'z', 'A'...'Z', '0'...'9', '-', '_', '.' => {},
+        else => return null,
+    };
+    return try std.fs.path.join(gpa, &.{ config_dir, "tasks", list_id });
 }
 
 /// One line for the card: what the tool is about to touch.
@@ -226,6 +288,49 @@ test "permission output keeps only what Claude accepts" {
     );
 
     try testing.expectEqual(@as(?[]u8, null), try output(testing.allocator, .permission, input, try parse(arena, "{\"behavior\":\"maybe\"}")));
+}
+
+test "TodoWrite progress counts its list" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const input = try parse(arena,
+        \\{"tool_name":"TodoWrite","tool_input":{"todos":[
+        \\ {"content":"Build","status":"completed","activeForm":"Building"},
+        \\ {"content":"Test","status":"in_progress","activeForm":"Running tests"},
+        \\ {"content":"Ship","status":"pending","activeForm":"Shipping"}]}}
+    );
+    const progress = todoProgress(input).?;
+    try testing.expectEqual(@as(u32, 1), progress.done);
+    try testing.expectEqual(@as(u32, 3), progress.total);
+    try testing.expectEqualStrings("Running tests", progress.current);
+    try testing.expectEqual(@as(?Progress, null), todoProgress(try parse(arena, "{\"tool_name\":\"TaskUpdate\"}")));
+}
+
+test "task progress takes the earliest task under way and skips deleted ones" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const tasks = [_]std.json.Value{
+        try parse(arena, "{\"id\":\"10\",\"subject\":\"Later\",\"status\":\"in_progress\"}"),
+        try parse(arena, "{\"id\":\"2\",\"subject\":\"Sooner\",\"status\":\"in_progress\"}"),
+        try parse(arena, "{\"id\":\"1\",\"subject\":\"Done\",\"status\":\"completed\"}"),
+        try parse(arena, "{\"id\":\"3\",\"subject\":\"Gone\",\"status\":\"deleted\"}"),
+    };
+    const progress = taskProgress(&tasks);
+    try testing.expectEqual(@as(u32, 1), progress.done);
+    try testing.expectEqual(@as(u32, 3), progress.total);
+    try testing.expectEqualStrings("Sooner", progress.current);
+    try testing.expectEqual(@as(u32, 0), taskProgress(&.{}).total);
+}
+
+test "a task list id never leaves the tasks folder" {
+    const dir = (try taskListDir(testing.allocator, "/h/.claude", "2c50820a-33b4")).?;
+    defer testing.allocator.free(dir);
+    try testing.expectEqualStrings("/h/.claude/tasks/2c50820a-33b4", dir);
+    try testing.expectEqual(@as(?[]u8, null), try taskListDir(testing.allocator, "/h/.claude", ".."));
+    try testing.expectEqual(@as(?[]u8, null), try taskListDir(testing.allocator, "/h/.claude", "a/../b"));
+    try testing.expectEqual(@as(?[]u8, null), try taskListDir(testing.allocator, "/h/.claude", ""));
 }
 
 test "question output merges the answers into the tool input" {

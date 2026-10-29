@@ -471,11 +471,14 @@ fn help(io: std.Io) !void {
         \\  [cl]ear <name>                                             Clear all session labels
         \\  agent notify [--session s] --event e [--agent a] [--pid n] Report agent presence (for agent hooks)
         \\  agent notify [--session s] --title t [--body b]            Report an agent notification
+        \\  agent notify [--session s] --kind progress --done n --total n [--current c]
+        \\                                                             Report an agent's task progress (total 0 clears it)
         \\  agent status [--session s] [--json]                        Show the session's agent presence
         \\  agent ask [--session s] --type t [--timeout secs]          Wait for a terminal's answer (JSON on stdin)
         \\  agent reply <rid> <nonce> --allow|--deny|--json d          Answer an ask from outside the terminal
         \\  agent events [--session s]                                 Stream agent events as JSON lines
         \\  agent hook claude permission|question                      Claude Code hook: ask the terminal (hook JSON on stdin)
+        \\  agent hook claude progress                                 Claude Code hook: report the session's task list
         \\  print-env [-s] <name> [key]                                Print tracked environment variables
         \\  [k]ill <name>... [--force]                                 Kill session and all attached clients
         \\  [hi]story <name> [--vt|--html] [--screen|--scrollback]     Output session scrollback
@@ -964,7 +967,7 @@ fn agentNotify(gpa: std.mem.Allocator, io: std.Io, cfg: *Cfg, args: anytype) !vo
             event.agent = value;
         } else if (std.mem.eql(u8, arg, "--kind")) {
             kind = std.meta.stringToEnum(agent.Kind, value) orelse
-                return agentWarn(io, "unknown --kind \"{s}\" (presence, notify)", .{value});
+                return agentWarn(io, "unknown --kind \"{s}\" (presence, notify, progress)", .{value});
         } else if (std.mem.eql(u8, arg, "--event")) {
             event.event = std.meta.stringToEnum(agent.Event, value) orelse
                 return agentWarn(io, "unknown --event \"{s}\"", .{value});
@@ -975,12 +978,24 @@ fn agentNotify(gpa: std.mem.Allocator, io: std.Io, cfg: *Cfg, args: anytype) !vo
             event.title = value;
         } else if (std.mem.eql(u8, arg, "--body")) {
             event.body = value;
+        } else if (std.mem.eql(u8, arg, "--done") or std.mem.eql(u8, arg, "--total")) {
+            const n = std.fmt.parseInt(u32, value, 10) catch
+                return agentWarn(io, "{s} must be a number, got \"{s}\"", .{ arg, value });
+            if (arg[2] == 'd') event.done = n else event.total = n;
+        } else if (std.mem.eql(u8, arg, "--current")) {
+            event.current = value;
         } else {
             return agentWarn(io, "unknown agent notify option \"{s}\"", .{arg});
         }
     }
     // A title or body without an event reads as a notification.
     event.kind = kind orelse if (event.event == null and (event.title != null or event.body != null)) .notify else .presence;
+    try sendAgentNotify(gpa, io, cfg, session, event);
+}
+
+/// Validates `event` and hands it to the session's daemon; warns or does
+/// nothing on failure, like `agent notify`.
+fn sendAgentNotify(gpa: std.mem.Allocator, io: std.Io, cfg: *Cfg, session: ?[]const u8, event: agent.Notify) !void {
     agent.validate(event) catch |err| return agentWarn(io, "invalid agent event: {s}", .{@errorName(err)});
 
     const sesh = socket.resolveSessionOrEnv(gpa, io, session) catch return;
@@ -1099,17 +1114,18 @@ fn requestDecision(gpa: std.mem.Allocator, io: std.Io, cfg: *Cfg, session: ?[]co
     }
 }
 
-/// `zmx agent hook claude <permission|question>`: a Claude Code hook. Reads
-/// the hook's JSON on stdin, asks the attached terminals, and prints the
+/// `zmx agent hook claude <permission|question|progress>`: a Claude Code hook.
+/// Reads the hook's JSON on stdin, asks the attached terminals, and prints the
 /// hook's JSON output when one answers. Prints nothing otherwise, so Claude
-/// asks in its own UI, and always exits 0.
+/// asks in its own UI, and always exits 0. `progress` reports the session's
+/// task list instead of asking.
 fn agentHook(gpa: std.mem.Allocator, io: std.Io, cfg: *Cfg, args: anytype) !void {
     const agent_name = args.next() orelse return agentWarn(io, "agent hook requires an agent (claude)", .{});
     if (detectHelp(agent_name)) return help(io);
     if (!std.mem.eql(u8, agent_name, "claude")) return agentWarn(io, "agent hook supports only claude, got \"{s}\"", .{agent_name});
-    const hook_name = args.next() orelse return agentWarn(io, "agent hook claude requires permission or question", .{});
+    const hook_name = args.next() orelse return agentWarn(io, "agent hook claude requires permission, question or progress", .{});
     const hook = std.meta.stringToEnum(agent_claude.Hook, hook_name) orelse
-        return agentWarn(io, "unknown claude hook \"{s}\" (permission, question)", .{hook_name});
+        return agentWarn(io, "unknown claude hook \"{s}\" (permission, question, progress)", .{hook_name});
     var session: ?[]const u8 = null;
     var timeout_s: u64 = agent.default_ask_timeout_ms / 1000;
     while (args.next()) |arg| {
@@ -1140,6 +1156,16 @@ fn agentHook(gpa: std.mem.Allocator, io: std.Io, cfg: *Cfg, args: anytype) !void
     const hook_input = std.json.parseFromSliceLeaky(std.json.Value, arena, input.items, .{}) catch {
         return agentWarn(io, "hook input on stdin must be JSON", .{});
     };
+    if (hook == .progress) {
+        const progress = agent_claude.todoProgress(hook_input) orelse try claudeTaskProgress(arena, io, hook_input) orelse return;
+        return sendAgentNotify(gpa, io, cfg, session, .{
+            .agent = "claude",
+            .kind = .progress,
+            .done = progress.done,
+            .total = progress.total,
+            .current = progress.current,
+        });
+    }
     const ask = try agent_claude.askFor(arena, hook, hook_input) orelse return;
 
     const decision_json = try requestDecision(gpa, io, cfg, session, .{
@@ -1158,6 +1184,34 @@ fn agentHook(gpa: std.mem.Allocator, io: std.Io, cfg: *Cfg, args: anytype) !void
     var stdout = std.Io.File.stdout().writer(io, &out_buf);
     try stdout.interface.print("{s}\n", .{out});
     try stdout.interface.flush();
+}
+
+/// The progress of a Claude session's task list, read from its task files;
+/// an empty list when it has none yet. Null when the folder can't be found.
+fn claudeTaskProgress(arena: std.mem.Allocator, io: std.Io, hook_input: std.json.Value) !?agent_claude.Progress {
+    const config_dir = if (lib_posix.getenv("CLAUDE_CONFIG_DIR")) |dir|
+        @as([]const u8, dir)
+    else
+        try std.fs.path.join(arena, &.{ lib_posix.getenv("HOME") orelse return null, ".claude" });
+    const list_id: []const u8 = if (lib_posix.getenv("CLAUDE_CODE_TASK_LIST_ID")) |id| id else blk: {
+        if (hook_input != .object) return null;
+        const session_id = hook_input.object.get("session_id") orelse return null;
+        if (session_id != .string) return null;
+        break :blk session_id.string;
+    };
+    const dir_path = try agent_claude.taskListDir(arena, config_dir, list_id) orelse return null;
+    var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch return agent_claude.taskProgress(&.{});
+    defer dir.close(io);
+    var tasks: std.ArrayList(std.json.Value) = .empty;
+    var iter = dir.iterate();
+    while (iter.next(io) catch null) |entry| {
+        if (tasks.items.len >= 1000) break;
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".json")) continue;
+        const bytes = dir.readFileAlloc(io, entry.name, arena, .limited(64 * 1024)) catch continue;
+        const task = std.json.parseFromSliceLeaky(std.json.Value, arena, bytes, .{}) catch continue;
+        try tasks.append(arena, task);
+    }
+    return agent_claude.taskProgress(tasks.items);
 }
 
 /// `zmx agent reply <rid> <nonce> --allow|--deny [--message m] | --json <decision>`:
