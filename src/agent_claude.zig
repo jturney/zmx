@@ -29,15 +29,16 @@ pub const Ask = struct {
 };
 
 /// The ask for a hook input, or null when the hook isn't one to ask about (a
-/// `PreToolUse` for any tool but `AskUserQuestion`). Slices point into
-/// `input` and `arena`.
+/// `PreToolUse` for any tool but `AskUserQuestion`, or a `PermissionRequest`
+/// for `AskUserQuestion`, whose permission prompt is the question picker the
+/// `question` hook handed back). Slices point into `input` and `arena`.
 pub fn askFor(arena: std.mem.Allocator, hook: Hook, input: std.json.Value) !?Ask {
     if (input != .object) return null;
     const tool = stringField(input, "tool_name") orelse return null;
     const tool_input = input.object.get("tool_input") orelse std.json.Value{ .object = .empty };
     switch (hook) {
         .progress => return null,
-        .permission => return .{
+        .permission => if (std.mem.eql(u8, tool, "AskUserQuestion")) return null else return .{
             .type = .permission,
             .title = tool,
             .summary = try summarize(arena, tool, tool_input),
@@ -237,6 +238,11 @@ test "permission ask summarizes the tool call" {
 
     const other = try parse(arena, "{\"tool_name\":\"mcp__x__y\",\"tool_input\":{\"n\":1}}");
     try testing.expectEqualStrings("{\"n\":1}", (try askFor(arena, .permission, other)).?.summary);
+
+    // Claude asks permission for a question handed back to its own picker;
+    // that picker is the prompt.
+    const question = try parse(arena, "{\"tool_name\":\"AskUserQuestion\",\"tool_input\":{\"questions\":[]}}");
+    try testing.expectEqual(@as(?Ask, null), try askFor(arena, .permission, question));
 }
 
 test "a long tool input is trimmed in the detail" {

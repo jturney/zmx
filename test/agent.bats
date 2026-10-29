@@ -510,3 +510,11 @@ start_hook() {
   run attach_capture test-hook-todo
   [[ "$output" != *"kind=progress"* ]]
 }
+
+@test "hook: a permission request for a question returns at once" {
+  "$ZMX" run test-hook-pq -d sleep 30
+  wait_for_session test-hook-pq
+  run bash -c 'echo "{\"tool_name\":\"AskUserQuestion\",\"tool_input\":{\"questions\":[]}}" | timeout 3 "$0" agent hook claude permission --session test-hook-pq' "$ZMX"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
