@@ -786,7 +786,8 @@ pub const Daemon = struct {
         self.subscribers.deinit(gpa);
         self.passthrough.deinit(gpa);
         self.pty_write_buf.deinit(gpa);
-        gpa.free(self.socket_path);
+        // `socket_path` is the caller's (see `init`): freeing it here too made
+        // every daemon abort on its way out.
     }
 
     pub fn shutdown(self: *Daemon, gpa: std.mem.Allocator) void {
@@ -2205,7 +2206,7 @@ test "handleEnvGet returns leader client's environment variables including unset
         .cfg = &cfg,
         .clients = .empty,
         .session_name = "test",
-        .socket_path = try alloc.dupe(u8, ""),
+        .socket_path = "",
         .running = true,
         .pid = 0,
         .created_at = 0,
